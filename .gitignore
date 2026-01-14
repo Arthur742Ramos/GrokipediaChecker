@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Screenshots (for privacy)
+*.png
+*.jpg
+*.jpeg
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# Logs
+*.log
+
+# Node
+node_modules/
+
+# Playwright
+playwright-report/
+test-results/
