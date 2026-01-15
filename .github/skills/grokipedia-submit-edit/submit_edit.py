@@ -97,6 +97,10 @@ def submit_edit(article_name, text_to_select, summary, correction=None, sources=
             
             let node;
             while (node = walker.nextNode()) {{
+                const parent = node.parentElement;
+                if (parent && parent.closest('script,style,noscript')) {{
+                    continue;
+                }}
                 const index = node.textContent.indexOf(textToFind);
                 if (index !== -1) {{
                     const range = document.createRange();
@@ -126,7 +130,8 @@ def submit_edit(article_name, text_to_select, summary, correction=None, sources=
         clicked = page.evaluate('''() => {
             const buttons = document.querySelectorAll('button');
             for (const btn of buttons) {
-                if (btn.textContent.includes('Suggest Edit')) {
+                const text = (btn.textContent || '').toLowerCase();
+                if (text.includes('suggest edit') || (text.includes('suggest') && text.includes('edit'))) {
                     btn.click();
                     return true;
                 }
