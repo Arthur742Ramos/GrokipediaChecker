@@ -12,7 +12,7 @@ This skill fetches article content from Grokipedia using the Comet browser with 
 Run the `fetch_content.py` script with an article name:
 
 ```bash
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
+.venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
 ```
 
 The script will:
@@ -39,10 +39,10 @@ The script outputs JSON with:
 
 ```bash
 # Fetch Lambda calculus article
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Lambda calculus"
+.venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Lambda calculus"
 
 # Fetch with spaces in name
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Marree Man"
+.venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Marree Man"
 ```
 
 ## Sequential Processing
@@ -51,9 +51,9 @@ Process articles one at a time for reliability:
 
 ```bash
 # Process articles sequentially
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article 1"
+.venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Article 1"
 # Analyze, verify, submit corrections...
 
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article 2"
+.venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Article 2"
 # Analyze, verify, submit corrections...
 ```

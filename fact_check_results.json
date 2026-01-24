@@ -348,5 +348,19 @@
     "issues_found": 1,
     "corrections_submitted": 0,
     "errors": []
+  },
+  {
+    "article": "Machu Picchu",
+    "status": "checked",
+    "issues_found": 0,
+    "corrections_submitted": 0,
+    "errors": []
+  },
+  {
+    "article": "Great Pyramid of Giza",
+    "status": "checked",
+    "issues_found": 1,
+    "corrections_submitted": 1,
+    "errors": []
   }
 ]

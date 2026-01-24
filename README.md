@@ -1,8 +1,8 @@
 # Grokipedia Fact-Checker & Content Improver
 
-An AI-powered tool for automated fact-checking, content improvement, and editing of [Grokipedia](https://grokipedia.com) articles using GitHub Copilot CLI and browser automation.
+An AI-powered tool for automated fact-checking, content improvement, and editing of [Grokipedia](https://grokipedia.com) articles using GitHub Copilot SDK with Claude Opus 4.5 and browser automation.
 
-## 🎯 What It Does
+## What It Does
 
 This project systematically analyzes Grokipedia articles to:
 
@@ -11,8 +11,9 @@ This project systematically analyzes Grokipedia articles to:
 - **Detect internal inconsistencies** (conflicting information within articles)
 - **Find writing quality issues** (awkward phrasing, clarity problems, grammar errors)
 - **Submit corrections** directly via browser automation
+- **Process articles in parallel** with configurable worker count
 
-## 📊 Results
+## Results
 
 | Metric | Value |
 |--------|-------|
@@ -27,40 +28,50 @@ This project systematically analyzes Grokipedia articles to:
 - **1996 World Series**: Andy Pettitte "complete game" → actually pitched **8 1/3 innings** (Wetteland got save)
 - **Super Bowl VIII**: Vikings "defeats in Super Bowls IV, V, VI" → Vikings only played in **Super Bowl IV** before VIII
 - **1995 World Series**: David Justice HR off "Dennis Martínez" → actually off **Jim Poole**
+- **Bermuda Triangle**: Columbus described as "late 19th/early 20th century explorer" → Columbus sailed in **1492 (15th century)**
 - **Phineas Gage**: Death year 1861 → actually **1860**
 
-## 🛠️ How It Works
+## How It Works
 
 ### Architecture
 
 ```
 ┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  GitHub Copilot CLI │────▶│  Browser Scripts │────▶│   Grokipedia    │
-│  (AI Analysis)      │     │  (Playwright/CDP)│     │   (Target Site) │
-└─────────────────────┘     └──────────────────┘     └─────────────────┘
-         │                           │
-         ▼                           ▼
-┌─────────────────────┐     ┌──────────────────┐
-│  Web Search API     │     │  Comet Browser   │
-│  (Fact Verification)│     │  (Authenticated) │
-└─────────────────────┘     └──────────────────┘
+│  TypeScript CLI     │────▶│  Browser Manager │────▶│   Grokipedia    │
+│  (Copilot SDK +     │     │  (Playwright/CDP)│     │   (Target Site) │
+│   Claude Opus 4.5)  │     └──────────────────┘     └─────────────────┘
+└─────────────────────┘              │
+         │                           ▼
+         ▼                  ┌──────────────────┐
+┌─────────────────────┐     │  Parallel Workers│
+│  Web Search API     │     │  (Browser Pages) │
+│  (Fact Verification)│     └──────────────────┘
+└─────────────────────┘
 ```
 
 ### Workflow
 
-1. **Fetch Article** → `fetch_content.py` retrieves article text via browser automation
-2. **AI Analysis** → Copilot identifies 3-5 verifiable claims per article
+1. **Fetch Article** → Browser automation retrieves article text
+2. **AI Analysis** → Claude Opus 4.5 identifies verifiable claims
 3. **Fact Verification** → Web search confirms or refutes claims
-4. **Submit Corrections** → `submit_edit.py` submits verified corrections
+4. **Submit Corrections** → Browser automation submits verified corrections
 
-## 🚀 Quick Start
+### Parallel Processing
+
+The CLI supports parallel workers for high-throughput fact-checking:
+- Each worker gets its own browser page and Copilot session
+- Workers pull articles from a shared queue
+- Real-time progress tracking across all workers
+- Configurable worker count (1-5 workers)
+
+## Quick Start
 
 ### Prerequisites
 
-- macOS with [Comet Browser](https://comet.com) (or modify for Chrome)
-- Python 3.8+
-- Node.js 16+
-- GitHub Copilot CLI access
+- macOS with [Comet Browser](https://comet.com) (or Chrome/Edge/Chromium)
+- Node.js 18+
+- GitHub Copilot CLI access (for Copilot SDK)
+- Python 3.8+ (for legacy scripts)
 
 ### Installation
 
@@ -69,22 +80,69 @@ This project systematically analyzes Grokipedia articles to:
 git clone https://github.com/Arthur742Ramos/GrokipediaChecker.git
 cd GrokipediaChecker
 
-# Install Python dependencies
+# Install CLI dependencies
+cd cli
+npm install
+npm run build
+cd ..
+
+# Install Python dependencies (for legacy scripts)
 pip install playwright
 playwright install chromium
 
-# Log into Grokipedia manually in Comet browser first
+# Log into Grokipedia manually in your browser first
 ```
 
 ### Usage
 
-#### Fetch an Article
+#### TypeScript CLI (Recommended)
+
 ```bash
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Super Bowl VII"
+cd cli
+
+# Review a specific article
+node dist/index.js -a "Bermuda Triangle" --dry-run
+
+# Review 5 random articles
+node dist/index.js -n 5 --dry-run
+
+# Parallel processing: 10 articles with 3 workers
+node dist/index.js -n 10 -p 3 --dry-run
+
+# Theme-based review with parallelization
+node dist/index.js -n 8 -p 4 -t history science
+
+# Use Comet browser (for existing login session)
+node dist/index.js -n 5 -p 2 -b comet
+
+# Show browser window (non-headless)
+node dist/index.js -n 3 --no-headless
+
+# Verbose mode (show AI reasoning)
+node dist/index.js -n 2 -v --dry-run
 ```
 
-#### Submit a Correction
+#### CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-n, --iterations <number>` | Number of articles to review | 1 |
+| `-p, --parallel <number>` | Number of parallel workers (max 5) | 1 |
+| `-a, --article <name>` | Specific article to review | - |
+| `-t, --theme <themes...>` | Theme(s) to search for articles | - |
+| `-b, --browser <type>` | Browser: chromium, firefox, webkit, chrome, edge, comet | chromium |
+| `--no-headless` | Show browser window | headless |
+| `--dry-run` | Analyze without submitting corrections | false |
+| `-v, --verbose` | Show Copilot's reasoning and tool calls | false |
+| `--list-browsers` | List available browsers | - |
+
+#### Python Scripts (Legacy)
+
 ```bash
+# Fetch an article
+python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Super Bowl VII"
+
+# Submit a correction
 python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
   --article "Super Bowl VII" \
   --text "returned for a near-score" \
@@ -93,70 +151,89 @@ python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
   --sources "https://en.wikipedia.org/wiki/Super_Bowl_VII"
 ```
 
-## 📁 Project Structure
+#### Comet Browser Workaround
+
+If article fetches fail with "Failed to start Comet browser", close running instances:
+
+```bash
+pkill -f "/Applications/Comet.app/Contents/MacOS/Comet"
+```
+
+Then reopen Comet, confirm you're signed in, and retry.
+
+## Project Structure
 
 ```
-GrokipediaChecker/
+Grokipedia/
+├── cli/                            # TypeScript CLI (recommended)
+│   ├── src/
+│   │   ├── index.ts                # Main CLI with parallel processing
+│   │   ├── browser.ts              # Browser manager (multi-page support)
+│   │   ├── fetcher.ts              # Article content fetcher
+│   │   └── submitter.ts            # Edit submission handler
+│   ├── dist/                       # Compiled JavaScript
+│   └── package.json
 ├── .github/
-│   ├── copilot-instructions.md    # AI agent instructions
 │   └── skills/
 │       ├── grokipedia-fetch-content/
-│       │   └── fetch_content.py   # Article fetcher
+│       │   └── fetch_content.py    # Python article fetcher
 │       ├── grokipedia-submit-edit/
-│       │   └── submit_edit.py     # Correction submitter
+│       │   └── submit_edit.py      # Python correction submitter
 │       ├── grokipedia-fact-check/
-│       │   └── SKILL.md           # Fact-checking guidelines
+│       │   └── SKILL.md            # Fact-checking guidelines
 │       └── grokipedia-batch-check/
-│           └── SKILL.md           # Batch processing guide
-├── fact_checker.py                # Standalone fact-checker
-├── batch_fact_checker.py          # Batch processing script
-├── grokipedia_editor.py           # Editor utilities
-├── fact_check_results.json        # Results log
+│           └── SKILL.md            # Batch processing guide
+├── fact_checker.py                 # Standalone Python fact-checker
+├── batch_fact_checker.py           # Python batch processing script
+├── fact_check_results.json         # Results log
 └── README.md
 ```
 
-## 🔍 Error Types Found
+## Error Types Found
 
 | Category | Examples | Frequency |
 |----------|----------|-----------|
 | **Wrong Numbers** | Hit counts, scores, medal counts | High |
 | **Wrong Names** | Pitcher who gave up HR, broadcaster | Medium |
 | **Wrong Dates** | Death years, game dates | Medium |
+| **Chronological Errors** | Historical figures in wrong centuries | Medium |
 | **Sequence Errors** | Events in wrong order | Low |
 | **Superlative Errors** | "First," "only" claims that are false | Low |
 | **Complete Game Claims** | Pitcher credited with CG but used reliever | Medium |
 
-## 💡 Key Insights
+## Key Insights
 
 - **Sports articles have the highest error rate** (~8-10%), especially for specific statistics
 - **Super Bowl articles** frequently confuse which teams played in which games
 - **World Series articles** often have wrong pitcher credits and inning counts
+- **Historical articles** sometimes place figures in wrong time periods
 - **"Complete game" claims** are frequently wrong—always verify with box scores
 - **Death years** for historical figures are commonly off by 1 year
 
-## ⚠️ Limitations
+## Limitations
 
 - Requires manual Grokipedia authentication in browser
 - Text selection can fail with special characters (em dashes, curly quotes)
-- Rate-limited by browser automation speed
+- Parallel workers share browser context (all use same login session)
 - Only corrects errors that can be verified with reliable sources
+- Copilot SDK rate limits may affect high-throughput processing
 
-## 🤝 Contributing
+## Contributing
 
 1. Fork the repository
 2. Run fact-checking on new article categories
 3. Submit PRs with your correction logs
 4. Improve the detection heuristics
 
-## 📜 License
+## License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- Built with [GitHub Copilot CLI](https://githubnext.com/projects/copilot-cli)
+- Built with [GitHub Copilot SDK](https://github.com/github/copilot-sdk) and Claude Opus 4.5
 - Browser automation via [Playwright](https://playwright.dev)
-- Fact verification via Bing AI Search
+- Fact verification via web search
 
 ---
 

@@ -32,3 +32,11 @@ node_modules/
 # Playwright
 playwright-report/
 test-results/
+
+# Temporary files
+.comet-temp/
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!fact_check_results.json

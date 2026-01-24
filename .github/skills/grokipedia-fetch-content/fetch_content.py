@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env .venv/bin/python
 """
 Grokipedia Content Fetcher
 Fetches article content from Grokipedia using Comet browser.
@@ -13,7 +13,8 @@ import subprocess
 
 COMET_EXECUTABLE = "/Applications/Comet.app/Contents/MacOS/Comet"
 COMET_PROFILE_PATH = os.path.expanduser("~/Library/Application Support/Comet")
-CDP_PORT = 9222
+HEADLESS_PROFILE_PATH = os.path.expanduser("~/Library/Application Support/Comet-Headless")
+CDP_PORT = 9224
 
 
 def fetch_content(article_name):
@@ -53,10 +54,22 @@ def fetch_content(article_name):
             return result
         
         if not port_in_use(CDP_PORT):
+            # Use separate profile to avoid conflicts with running Comet
+            # First, copy cookies from main profile if headless profile doesn't exist
+            if not os.path.exists(HEADLESS_PROFILE_PATH):
+                os.makedirs(HEADLESS_PROFILE_PATH, exist_ok=True)
+                # Copy cookies/login state from main profile
+                main_cookies = os.path.join(COMET_PROFILE_PATH, "Default", "Cookies")
+                headless_default = os.path.join(HEADLESS_PROFILE_PATH, "Default")
+                if os.path.exists(main_cookies):
+                    os.makedirs(headless_default, exist_ok=True)
+                    import shutil
+                    shutil.copy2(main_cookies, os.path.join(headless_default, "Cookies"))
+            
             comet_process = subprocess.Popen([
                 COMET_EXECUTABLE,
                 f"--remote-debugging-port={CDP_PORT}",
-                f"--user-data-dir={COMET_PROFILE_PATH}",
+                f"--user-data-dir={HEADLESS_PROFILE_PATH}",
                 "--no-first-run",
                 "--no-session-restore",
                 "--headless=new",
@@ -64,7 +77,7 @@ def fetch_content(article_name):
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             if not wait_for_cdp(CDP_PORT):
-                result["error"] = "Failed to start Comet browser"
+                result["error"] = "Failed to start Comet browser. Try closing Comet manually first."
                 return result
         
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")

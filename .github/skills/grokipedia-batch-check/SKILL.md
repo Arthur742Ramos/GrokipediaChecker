@@ -14,34 +14,32 @@ Process articles one at a time for reliability:
 ### Stage 1: Fetch Article
 ```bash
 cd /Users/arthur/Desktop/Grokipedia
-python3 ../.github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
+.venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
 ```
 
 ### Stage 2: AI Analysis
 Analyze the article for:
 
-**Factual Issues:**
-- Factual errors (dates, numbers, names)
-- Internal inconsistencies
-- Outdated information
+**Factual Issues (look for obvious problems):**
+- Internal inconsistencies (same fact stated differently)
+- Dates/numbers that seem off
+- Logical contradictions
 
 **Writing Quality Issues:**
 - Awkward or confusing phrasing
 - Run-on sentences
 - Grammar and spelling errors
 - Redundancy and wordiness
-- Jargon without explanation
-- Unclear pronoun references
 
-### Stage 3: Verification
-Verify suspicious claims:
-- Use `web_search` for quick fact verification
-- Use `web_fetch` for detailed Wikipedia checks
+### Stage 3: Targeted Verification
+Only verify claims that seem suspicious:
+- Use `web_search` for dates/facts that look wrong
+- Skip verification for well-known facts and writing issues
 
 ### Stage 4: Submit Corrections
 Submit all corrections for the current article before moving to the next:
 ```bash
-python3 ../.github/skills/grokipedia-submit-edit/submit_edit.py --article "Article Name" ...
+.venv/bin/python .github/skills/grokipedia-submit-edit/submit_edit.py --article "Article Name" ...
 ```
 
 ### Stage 5: Move to Next Article

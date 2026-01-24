@@ -11,7 +11,7 @@ This skill guides the AI to analyze article content and identify factual errors,
 
 1. **Fetch content**: Run the fetch script to get article content
    ```bash
-   python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
+   .venv/bin/python .github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
    ```
 
 2. **AI Analysis**: Carefully read the content and check for:
@@ -24,33 +24,22 @@ This skill guides the AI to analyze article content and identify factual errors,
    - **Redundancy**: Unnecessary repetition of information
    - **Missing context**: Important details that would help readers understand
 
-3. **PROACTIVE Fact-Checking (REQUIRED)**: 
+3. **Targeted Fact-Checking (when needed)**:
    
-   **Do NOT just skim for obvious errors.** For EVERY article, actively verify 3-5 key facts using web_search:
+   Use web_search ONLY for claims that seem suspicious or uncertain:
+   - Dates/numbers that look wrong or inconsistent
+   - Claims you're not confident about
+   - Unusual or surprising facts
+   
+   **Skip verification for:**
+   - Well-known facts you're confident about
+   - Internal inconsistencies (these don't need web lookup)
+   - Writing quality issues
    
    ```bash
-   # Verify birth/death dates
-   web_search("Albert Einstein birth date March 14 1879")
-   
-   # Verify event dates
-   web_search("Battle of Actium date 31 BC")
-   
-   # Verify numerical claims
-   web_search("Great Wall of China total length kilometers")
-   
-   # Verify attributions
-   web_search("who discovered penicillin Alexander Fleming 1928")
+   # Example: Only verify if a claim seems off
+   web_search("Phineas Gage death year 1860 or 1861")
    ```
-   
-   **What to verify in each article:**
-   - Birth/death dates of people mentioned
-   - Key event dates and locations
-   - Numerical claims (distances, populations, measurements)
-   - Names and titles of people, places, organizations
-   - Scientific facts and discoveries
-   - Historical claims and attributions
-   
-   **IMPORTANT**: A well-written article can still have factual errors. Always verify before moving on.
 
 4. **Submit corrections**: For confirmed errors or improvements, use the submit skill
 
@@ -134,7 +123,8 @@ For awkward phrasing like "The event which occurred was very significant in natu
 
 ## Important Guidelines
 
+- Prioritize internal inconsistencies and obvious errors (these don't need web verification)
+- Only use web_search for claims you're uncertain about
 - Only flag issues you are confident about
-- For uncertain claims, use web_search to verify before flagging
 - Prefer not submitting over submitting incorrect corrections
 - Multiple different measurements in an article are normal if they refer to different things

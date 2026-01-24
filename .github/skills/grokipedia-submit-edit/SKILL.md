@@ -12,7 +12,7 @@ This skill submits corrections to Grokipedia articles using the browser-based ed
 Run the `submit_edit.py` script:
 
 ```bash
-python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
+.venv/bin/python .github/skills/grokipedia-submit-edit/submit_edit.py \
   --article "Article Name" \
   --text "text to select and correct" \
   --summary "Description of the correction" \
@@ -47,7 +47,7 @@ python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
 
 ```bash
 # Fix an inconsistent measurement
-python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
+.venv/bin/python .github/skills/grokipedia-submit-edit/submit_edit.py \
   --article "Marree Man" \
   --text "approximately 2.7 kilometers (1.7 miles) in height" \
   --summary "Fix inconsistent measurement - article states 3.5km elsewhere" \
@@ -74,10 +74,10 @@ Submit corrections to the same article sequentially:
 
 ```bash
 # Submit first correction
-python3 .github/skills/grokipedia-submit-edit/submit_edit.py --article "Article Name" --text "first text" ...
+.venv/bin/python .github/skills/grokipedia-submit-edit/submit_edit.py --article "Article Name" --text "first text" ...
 
 # Wait for completion, then submit next correction
-python3 .github/skills/grokipedia-submit-edit/submit_edit.py --article "Article Name" --text "second text" ...
+.venv/bin/python .github/skills/grokipedia-submit-edit/submit_edit.py --article "Article Name" --text "second text" ...
 ```
 
 Process articles one at a time for reliability. Complete all corrections for one article before moving to the next.
