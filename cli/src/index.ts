@@ -5,18 +5,24 @@
  * Uses GitHub Copilot SDK with Claude Opus 4.5 to analyze articles
  * for factual errors and submit corrections.
  * 
+ * Now using playwright-cli for browser automation:
+ * - Persistent sessions that preserve login state
+ * - Simple CLI-based browser control
+ * - Session management for parallel workers
+ * 
  * Flow:
- * 1. We fetch article content using Playwright
+ * 1. We fetch article content using playwright-cli
  * 2. We pass the content to Copilot for analysis
  * 3. Copilot uses web_search to verify facts and returns JSON with errors
- * 4. We parse the response and submit corrections via Playwright
+ * 4. We parse the response and submit corrections via playwright-cli
  */
 
 import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
 import { CopilotClient, SessionEvent } from "@github/copilot-sdk";
-import { startBrowser, BrowserManager, BrowserType, getAvailableBrowsers } from "./browser.js";
+import { startBrowser, BrowserManager, BrowserType, getAvailableBrowsers, stopAllBrowsers } from "./browser.js";
+import { PlaywrightCLISession } from "./playwright-cli.js";
 import {
   fetchArticleContent,
   getRandomArticle,
@@ -25,7 +31,6 @@ import {
   ArticleContent,
 } from "./fetcher.js";
 import { submitEdit, EditRequest } from "./submitter.js";
-import { Page } from "playwright";
 
 // Types
 interface ReviewOptions {
@@ -55,8 +60,8 @@ interface AnalysisResult {
 // Worker types for parallel processing
 interface Worker {
   id: number;
-  page: Page;
-  session: Awaited<ReturnType<CopilotClient["createSession"]>>;
+  session: PlaywrightCLISession;
+  copilotSession: Awaited<ReturnType<CopilotClient["createSession"]>>;
   busy: boolean;
 }
 
@@ -159,11 +164,10 @@ If no factual errors are found, return empty errors array. Focus on factual accu
 
   let fullResponse = "";
   let dotCount = 0;
-  let reasoningBuffer = "";
 
   // Collect the response from multiple event types
   session.on((event: SessionEvent) => {
-    const eventAny = event as any; // For accessing properties not in type definitions
+    const eventAny = event as any;
     
     // Stream deltas (actual response text)
     if (event.type === "assistant.message_delta") {
@@ -175,7 +179,7 @@ If no factual errors are found, return empty errors array. Focus on factual accu
         }
       }
     }
-    // Show progress dots for reasoning (or full text in verbose mode)
+    // Show progress dots for reasoning
     if (event.type === "assistant.reasoning_delta") {
       const reasoning = event.data?.deltaContent || "";
       if (verbose) {
@@ -187,7 +191,7 @@ If no factual errors are found, return empty errors array. Focus on factual accu
         }
       }
     }
-    // Tool calls - show what Copilot is doing (event type may not be in SDK types)
+    // Tool calls
     if (eventAny.type === "tool.call" && verbose) {
       const toolName = eventAny.data?.name || "unknown";
       const toolArgs = eventAny.data?.arguments || {};
@@ -244,11 +248,11 @@ async function processArticle(
   const prefix = chalk.cyan(`[W${worker.id}]`);
 
   try {
-    // Fetch article
+    // Fetch article using playwright-cli session
     if (options.verbose) {
       console.log(`${prefix} Fetching: ${articleName}`);
     }
-    const article = await fetchArticleContent(worker.page, articleName);
+    const article = await fetchArticleContent(worker.session, articleName, !options.headless);
 
     if (article.error) {
       console.log(chalk.red(`${prefix} Failed to fetch ${articleName}: ${article.error}`));
@@ -267,7 +271,7 @@ async function processArticle(
     if (options.verbose) {
       console.log(`${prefix} Analyzing...`);
     }
-    const analysis = await analyzeArticle(worker.session, article, options.verbose);
+    const analysis = await analyzeArticle(worker.copilotSession, article, options.verbose);
 
     result.errorsFound = analysis.errors.length;
     console.log(`${prefix} ${articleName}: ${analysis.errors.length} error(s) found`);
@@ -295,7 +299,7 @@ async function processArticle(
           sources: error.sources,
         };
 
-        const submitResult = await submitEdit(worker.page, request);
+        const submitResult = await submitEdit(worker.session, request, !options.headless);
 
         if (submitResult.success) {
           console.log(chalk.green(`${prefix}   Correction submitted`));
@@ -316,7 +320,7 @@ async function processArticle(
 }
 
 /**
- * Create worker pool with browser pages and Copilot sessions
+ * Create worker pool with playwright-cli sessions and Copilot sessions
  */
 async function createWorkerPool(
   browserManager: BrowserManager,
@@ -335,18 +339,18 @@ When analyzing an article:
 
 Be thorough but precise. Quality over quantity.`;
 
-  // Create pages sequentially with small delays to avoid race conditions
+  // Create sessions sequentially with small delays
   for (let i = 0; i < workerCount; i++) {
-    let page: Page;
+    let session: PlaywrightCLISession;
     if (i === 0) {
-      page = browserManager.page;
+      session = browserManager.session;
     } else {
-      // Small delay between page creations
+      // Small delay between session creations
       await new Promise(r => setTimeout(r, 200));
-      page = await browserManager.createPage();
+      session = await browserManager.createSession();
     }
     
-    const session = await client.createSession({
+    const copilotSession = await client.createSession({
       model: "claude-opus-4-5",
       streaming: true,
       systemMessage: { content: systemMessage },
@@ -354,20 +358,13 @@ Be thorough but precise. Quality over quantity.`;
 
     workers.push({
       id: i + 1,
-      page,
       session,
+      copilotSession,
       busy: false,
     });
   }
 
   return workers;
-}
-
-/**
- * Get next available worker from pool
- */
-function getAvailableWorker(workers: Worker[]): Worker | null {
-  return workers.find((w) => !w.busy) || null;
 }
 
 /**
@@ -388,7 +385,7 @@ function displayProgress(progress: WorkerProgress): void {
 async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   const spinner = ora();
 
-  console.log(chalk.bold.blue("\n=== Grokipedia Parallel Article Reviewer ===\n"));
+  console.log(chalk.bold.blue("\n=== Grokipedia Parallel Article Reviewer (playwright-cli) ===\n"));
   console.log(chalk.gray(`Iterations: ${options.iterations}`));
   console.log(chalk.gray(`Parallel workers: ${options.parallel}`));
   console.log(chalk.gray(`Mode: ${options.article ? "Specific article" : options.themes?.length ? "Theme-based" : "Random"}`));
@@ -398,14 +395,14 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   console.log(chalk.gray(`Verbose: ${options.verbose}`));
   console.log();
 
-  // Start browser
-  spinner.start(`Starting ${options.browser} browser...`);
+  // Start browser manager
+  spinner.start(`Starting playwright-cli browser sessions...`);
   try {
     browserManager = await startBrowser({
       type: options.browser,
       headless: options.headless,
     });
-    spinner.succeed(`Browser started (${browserManager.browserType})`);
+    spinner.succeed(`Browser manager started`);
   } catch (error) {
     spinner.fail(`Failed to start browser: ${error}`);
     process.exit(1);
@@ -419,7 +416,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     spinner.succeed("Connected to Copilot");
   } catch (error) {
     spinner.fail(`Failed to connect to Copilot: ${error}`);
-    await browserManager.stop();
+    await stopAllBrowsers();
     process.exit(1);
   }
 
@@ -432,7 +429,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   } catch (error) {
     spinner.fail(`Failed to create workers: ${error}`);
     await client.stop();
-    await browserManager.stop();
+    await stopAllBrowsers();
     process.exit(1);
   }
 
@@ -446,7 +443,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   } else if (options.themes && options.themes.length > 0) {
     spinner.start(`Searching for articles in themes: ${options.themes.join(", ")}`);
     for (const theme of options.themes) {
-      const articles = await getArticlesByTheme(browserManager.page, theme);
+      const articles = await getArticlesByTheme(browserManager.session, theme, !options.headless);
       specificArticles.push(...articles.slice(0, 5));
     }
     specificArticles = [...new Set(specificArticles)].slice(0, options.iterations);
@@ -472,7 +469,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   let topicCache: string[] = [];
   const usedTopics = new Set<string>();
   
-  // Get next article name - either from specific list or generate on demand
+  // Get next article name
   const getNextArticle = async (workerId: number): Promise<string | null> => {
     if (useSpecificList) {
       const idx = topicIndex++;
@@ -490,7 +487,6 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
           console.log(chalk.gray(`[W${workerId}] Generating ${batchCount} article topics...`));
         }
         const newTopics = await generateRandomArticleTopics(client, batchCount);
-        // Filter out already used topics
         const freshTopics = newTopics.filter(t => !usedTopics.has(t));
         topicCache.push(...freshTopics);
       }
@@ -504,21 +500,18 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     return null;
   };
 
-  // Process articles with worker pool - each worker runs independently
+  // Process articles with worker pool
   const runningTasks: Promise<void>[] = [];
 
   const processNext = async (worker: Worker): Promise<void> => {
-    // Small stagger per worker to avoid thundering herd
+    // Small stagger per worker
     await new Promise(r => setTimeout(r, worker.id * 300));
     
     while (progress.completed < options.iterations) {
-      // Check if we've done enough
       if (progress.completed >= options.iterations) break;
       
-      // Get next article
       const articleName = await getNextArticle(worker.id);
       if (!articleName) {
-        // No more articles available, wait a bit and check again
         await new Promise(r => setTimeout(r, 1000));
         if (progress.completed >= options.iterations) break;
         continue;
@@ -530,10 +523,10 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         results.push(result);
       } catch (error) {
         console.log(chalk.red(`[W${worker.id}] Fatal error: ${error}`));
-        progress.completed++; // Count as completed to avoid infinite loop
-        // Try to recover by getting a new page
+        progress.completed++;
+        // Try to recover by getting a new session
         try {
-          worker.page = await browserManager!.createPage();
+          worker.session = await browserManager!.createSession();
         } catch (e) {
           console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
           break;
@@ -545,7 +538,6 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         displayProgress(progress);
       }
       
-      // Small delay between articles
       await new Promise(r => setTimeout(r, 300));
     }
   };
@@ -555,7 +547,6 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     runningTasks.push(processNext(worker));
   }
 
-  // Wait for all workers to complete
   await Promise.all(runningTasks);
 
   console.log("\n");
@@ -586,14 +577,14 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
 
   spinner.start("Cleaning up...");
   await client.stop();
-  await browserManager.stop();
+  await stopAllBrowsers();
   spinner.succeed("Done");
 }
 
 async function runReviewLoop(options: ReviewOptions): Promise<void> {
   const spinner = ora();
 
-  console.log(chalk.bold.blue("\n=== Grokipedia Article Reviewer ===\n"));
+  console.log(chalk.bold.blue("\n=== Grokipedia Article Reviewer (playwright-cli) ===\n"));
   console.log(chalk.gray(`Iterations: ${options.iterations}`));
   console.log(chalk.gray(`Mode: ${options.article ? "Specific article" : options.themes?.length ? "Theme-based" : "Random"}`));
   console.log(chalk.gray(`Browser: ${options.browser}`));
@@ -603,13 +594,13 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
   console.log();
 
   // Start browser
-  spinner.start(`Starting ${options.browser} browser...`);
+  spinner.start(`Starting playwright-cli browser session...`);
   try {
     browserManager = await startBrowser({
       type: options.browser,
       headless: options.headless,
     });
-    spinner.succeed(`Browser started (${browserManager.browserType})`);
+    spinner.succeed(`Browser session started`);
   } catch (error) {
     spinner.fail(`Failed to start browser: ${error}`);
     process.exit(1);
@@ -623,7 +614,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
     spinner.succeed("Connected to Copilot");
   } catch (error) {
     spinner.fail(`Failed to connect to Copilot: ${error}`);
-    await browserManager.stop();
+    await stopAllBrowsers();
     process.exit(1);
   }
 
@@ -650,7 +641,7 @@ Be thorough but precise. Quality over quantity.`,
   } catch (error) {
     spinner.fail(`Failed to create session: ${error}`);
     await client.stop();
-    await browserManager.stop();
+    await stopAllBrowsers();
     process.exit(1);
   }
 
@@ -662,7 +653,7 @@ Be thorough but precise. Quality over quantity.`,
   } else if (options.themes && options.themes.length > 0) {
     spinner.start(`Searching for articles in themes: ${options.themes.join(", ")}`);
     for (const theme of options.themes) {
-      const articles = await getArticlesByTheme(browserManager.page, theme);
+      const articles = await getArticlesByTheme(browserManager.session, theme, !options.headless);
       articlesToReview.push(...articles.slice(0, 5));
     }
     articlesToReview = [...new Set(articlesToReview)];
@@ -690,16 +681,15 @@ Be thorough but precise. Quality over quantity.`,
     console.log(chalk.bold.yellow(`Iteration ${i + 1} of ${options.iterations}`));
     console.log(chalk.bold.yellow(`${"=".repeat(60)}\n`));
 
-    // Determine which article to review
     if (articlesToReview.length === 0) {
       console.log(chalk.yellow("No articles available to review"));
       break;
     }
     const articleName = articlesToReview[i % articlesToReview.length];
 
-    // Fetch article content
+    // Fetch article content using playwright-cli
     spinner.start(`Fetching article: ${articleName}`);
-    const article = await fetchArticleContent(browserManager.page, articleName);
+    const article = await fetchArticleContent(browserManager.session, articleName, !options.headless);
 
     if (article.error) {
       spinner.fail(`Failed to fetch article: ${article.error}`);
@@ -754,7 +744,7 @@ Be thorough but precise. Quality over quantity.`,
           sources: error.sources,
         };
 
-        const result = await submitEdit(browserManager.page, request);
+        const result = await submitEdit(browserManager.session, request, !options.headless);
 
         if (result.success) {
           spinner.succeed("Correction submitted");
@@ -785,7 +775,7 @@ Be thorough but precise. Quality over quantity.`,
 
   spinner.start("Cleaning up...");
   await client.stop();
-  await browserManager.stop();
+  await stopAllBrowsers();
   spinner.succeed("Done");
 }
 
@@ -794,15 +784,48 @@ const program = new Command();
 
 program
   .name("grokipedia-review")
-  .description("Automated Grokipedia article fact-checker using GitHub Copilot SDK")
-  .version("1.0.0");
+  .description("Automated Grokipedia article fact-checker using GitHub Copilot SDK and playwright-cli")
+  .version("2.0.0");
+
+// Login subcommand - opens browser for manual login
+program
+  .command("login")
+  .description("Open browser to log in to Grokipedia (session will be saved)")
+  .action(async () => {
+    console.log(chalk.bold.blue("\n=== Grokipedia Login ===\n"));
+    console.log(chalk.gray("Opening browser for login. Please log in to Grokipedia."));
+    console.log(chalk.gray("The session will be saved for future use."));
+    console.log(chalk.gray("Press Ctrl+C when done.\n"));
+
+    const browserManager = await startBrowser({
+      type: "chromium",
+      headless: false, // Must be headed for login
+    });
+
+    // Navigate to Grokipedia
+    await browserManager.session.open("https://grokipedia.com", true);
+    
+    console.log(chalk.cyan("Browser opened. Please log in to Grokipedia."));
+    console.log(chalk.cyan("Press Ctrl+C when you're done logging in.\n"));
+
+    // Keep the process running until user presses Ctrl+C
+    process.on("SIGINT", async () => {
+      console.log(chalk.yellow("\n\nSaving session..."));
+      await browserManager.stop();
+      console.log(chalk.green("Session saved! You can now run reviews without --no-headless."));
+      process.exit(0);
+    });
+
+    // Keep alive
+    await new Promise(() => {});
+  });
 
 program
   .option("-n, --iterations <number>", "Number of articles to review", "1")
   .option("-p, --parallel <number>", "Number of parallel workers (default: 1, sequential)", "1")
   .option("-a, --article <name>", "Specific article to review")
   .option("-t, --theme <themes...>", "Theme(s) to search for articles (e.g., -t physics history)")
-  .option("-b, --browser <type>", "Browser to use: chromium, firefox, webkit, chrome, edge, comet", "chromium")
+  .option("-b, --browser <type>", "Browser to use: chromium, chrome, edge, comet", "chromium")
   .option("--no-headless", "Show browser window (default: headless)")
   .option("--dry-run", "Analyze without submitting corrections")
   .option("-v, --verbose", "Show Copilot's reasoning and tool calls")
@@ -818,7 +841,7 @@ program
       process.exit(0);
     }
 
-    const validBrowsers: BrowserType[] = ["chromium", "firefox", "webkit", "chrome", "edge", "comet"];
+    const validBrowsers: BrowserType[] = ["chromium", "chrome", "edge", "comet"];
     if (!validBrowsers.includes(opts.browser)) {
       console.error(chalk.red(`Error: Invalid browser type "${opts.browser}". Valid options: ${validBrowsers.join(", ")}`));
       process.exit(1);
@@ -845,13 +868,13 @@ program
       process.exit(1);
     }
 
-    // Cap parallel workers at 10 to avoid overwhelming resources
+    // Cap parallel workers at 10
     if (options.parallel > 10) {
       console.log(chalk.yellow(`Warning: Capping parallel workers at 10 (requested ${options.parallel})`));
       options.parallel = 10;
     }
 
-    // Use parallel loop if more than 1 worker, otherwise use sequential
+    // Use parallel loop if more than 1 worker
     if (options.parallel > 1) {
       await runParallelReviewLoop(options);
     } else {

@@ -1,9 +1,9 @@
 /**
  * Grokipedia Content Fetcher
- * Fetches article content from Grokipedia
+ * Fetches article content from Grokipedia using playwright-cli
  */
 
-import { Page } from "playwright";
+import { PlaywrightCLISession, findRefByText } from "./playwright-cli.js";
 import { CopilotClient } from "@github/copilot-sdk";
 
 export interface ArticleSection {
@@ -22,8 +22,9 @@ export interface ArticleContent {
 }
 
 export async function fetchArticleContent(
-  page: Page,
-  articleName: string
+  session: PlaywrightCLISession,
+  articleName: string,
+  headed: boolean = false
 ): Promise<ArticleContent> {
   const articleSlug = articleName.replace(/ /g, "_");
   const url = `https://grokipedia.com/page/${articleSlug}`;
@@ -38,62 +39,61 @@ export async function fetchArticleContent(
 
   try {
     // Navigate to article
-    await page.goto(url, { timeout: 60000 });
+    await session.open(url, headed);
 
-    try {
-      await page.waitForLoadState("networkidle", { timeout: 15000 });
-    } catch {
-      // Continue even if networkidle times out
-    }
+    // Wait for page to load
+    await session.wait(3000);
 
-    // Wait a bit for dynamic content
-    await page.waitForTimeout(2000);
-
+    // Get a snapshot to check for Login button
+    const snapshot = await session.snapshot();
+    
     // Check if signed in (no Login button visible)
-    const loginBtn = page.locator('button:has-text("Login")');
-    const loginCount = await loginBtn.count();
-    if (loginCount === 0) {
-      result.signedIn = true;
-    } else {
-      try {
-        result.signedIn = !(await loginBtn.first().isVisible());
-      } catch {
-        result.signedIn = true;
-      }
-    }
+    const loginRef = findRefByText(snapshot, "Login", { partial: true });
+    result.signedIn = loginRef === null;
 
-    // Extract content
-    result.content = await page.evaluate(() => {
-      const article =
-        document.querySelector("article") ||
-        document.querySelector('[role="article"]') ||
-        document.querySelector("main");
-      return article ? article.innerText : document.body.innerText;
-    });
+    // Extract content using eval
+    const contentScript = `
+      (function() {
+        var article =
+          document.querySelector("article") ||
+          document.querySelector('[role="article"]') ||
+          document.querySelector("main");
+        return article ? article.innerText : document.body.innerText;
+      })()
+    `;
+    result.content = await session.eval(contentScript);
 
-    // Extract sections
-    result.sections = await page.evaluate(() => {
-      const sections: ArticleSection[] = [];
-      const headings = document.querySelectorAll("h1, h2, h3");
+    // Extract sections using eval
+    const sectionsScript = `
+      (function() {
+        var sections = [];
+        var headings = document.querySelectorAll("h1, h2, h3");
 
-      headings.forEach((heading) => {
-        let content = "";
-        let sibling = heading.nextElementSibling;
+        headings.forEach(function(heading) {
+          var content = "";
+          var sibling = heading.nextElementSibling;
 
-        while (sibling && !["H1", "H2", "H3"].includes(sibling.tagName)) {
-          content += (sibling as HTMLElement).innerText + "\n";
-          sibling = sibling.nextElementSibling;
-        }
+          while (sibling && ["H1", "H2", "H3"].indexOf(sibling.tagName) === -1) {
+            content += sibling.innerText + "\\n";
+            sibling = sibling.nextElementSibling;
+          }
 
-        sections.push({
-          level: heading.tagName,
-          title: (heading as HTMLElement).innerText,
-          content: content.trim(),
+          sections.push({
+            level: heading.tagName,
+            title: heading.innerText,
+            content: content.trim(),
+          });
         });
-      });
 
-      return sections;
-    });
+        return JSON.stringify(sections);
+      })()
+    `;
+    const sectionsJson = await session.eval(sectionsScript);
+    try {
+      result.sections = JSON.parse(sectionsJson);
+    } catch {
+      result.sections = [];
+    }
   } catch (error) {
     result.error = String(error);
   }
@@ -101,27 +101,33 @@ export async function fetchArticleContent(
   return result;
 }
 
-export async function getRandomArticle(page: Page): Promise<string | null> {
+export async function getRandomArticle(
+  session: PlaywrightCLISession,
+  headed: boolean = false
+): Promise<string | null> {
   try {
     // Go to Grokipedia homepage
-    await page.goto("https://grokipedia.com", { timeout: 60000 });
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+    await session.open("https://grokipedia.com", headed);
+    await session.wait(3000);
 
-    // Look for article links on the page
-    const articleLinks = await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
-      return links
-        .map((link) => {
-          const href = link.getAttribute("href");
-          if (href) {
-            const match = href.match(/\/page\/([^/]+)/);
-            return match ? match[1].replace(/_/g, " ") : null;
-          }
-          return null;
-        })
-        .filter((name): name is string => name !== null);
-    });
+    // Extract article links using eval
+    const script = `
+      (function() {
+        var links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
+        return JSON.stringify(links
+          .map(function(link) {
+            var href = link.getAttribute("href");
+            if (href) {
+              var match = href.match(/\\/page\\/([^/]+)/);
+              return match ? match[1].replace(/_/g, " ") : null;
+            }
+            return null;
+          })
+          .filter(function(name) { return name !== null; }));
+      })()
+    `;
+    const linksJson = await session.eval(script);
+    const articleLinks: string[] = JSON.parse(linksJson);
 
     if (articleLinks.length > 0) {
       const randomIndex = Math.floor(Math.random() * articleLinks.length);
@@ -135,30 +141,34 @@ export async function getRandomArticle(page: Page): Promise<string | null> {
 }
 
 export async function getArticlesByTheme(
-  page: Page,
-  theme: string
+  session: PlaywrightCLISession,
+  theme: string,
+  headed: boolean = false
 ): Promise<string[]> {
   try {
     // Search for articles by theme
     const searchUrl = `https://grokipedia.com/search?q=${encodeURIComponent(theme)}`;
-    await page.goto(searchUrl, { timeout: 60000 });
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+    await session.open(searchUrl, headed);
+    await session.wait(3000);
 
     // Extract article names from search results
-    const articles = await page.evaluate(() => {
-      const links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
-      return links
-        .map((link) => {
-          const href = link.getAttribute("href");
-          if (href) {
-            const match = href.match(/\/page\/([^/]+)/);
-            return match ? match[1].replace(/_/g, " ") : null;
-          }
-          return null;
-        })
-        .filter((name): name is string => name !== null);
-    });
+    const script = `
+      (function() {
+        var links = Array.from(document.querySelectorAll('a[href*="/page/"]'));
+        return JSON.stringify(links
+          .map(function(link) {
+            var href = link.getAttribute("href");
+            if (href) {
+              var match = href.match(/\\/page\\/([^/]+)/);
+              return match ? match[1].replace(/_/g, " ") : null;
+            }
+            return null;
+          })
+          .filter(function(name) { return name !== null; }));
+      })()
+    `;
+    const articlesJson = await session.eval(script);
+    const articles: string[] = JSON.parse(articlesJson);
 
     return [...new Set(articles)]; // Remove duplicates
   } catch {

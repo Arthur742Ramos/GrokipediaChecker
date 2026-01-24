@@ -1,9 +1,9 @@
 /**
  * Grokipedia Edit Submitter
- * Submits corrections to Grokipedia articles
+ * Submits corrections to Grokipedia articles using playwright-cli
  */
 
-import { Page } from "playwright";
+import { PlaywrightCLISession, findRefByText, findRefsByPattern } from "./playwright-cli.js";
 
 export interface EditResult {
   success: boolean;
@@ -22,8 +22,9 @@ export interface EditRequest {
 }
 
 export async function submitEdit(
-  page: Page,
-  request: EditRequest
+  session: PlaywrightCLISession,
+  request: EditRequest,
+  headed: boolean = false
 ): Promise<EditResult> {
   const { articleName, textToSelect, summary, correction, sources } = request;
   const articleSlug = articleName.replace(/ /g, "_");
@@ -38,352 +39,261 @@ export async function submitEdit(
   };
 
   try {
-    // Navigate to article if not already there
-    const currentUrl = page.url();
-    if (!currentUrl.includes(articleSlug)) {
-      await page.goto(url, { timeout: 60000 });
-      try {
-        await page.waitForLoadState("networkidle", { timeout: 15000 });
-      } catch {
-        // Continue
-      }
-      await page.waitForTimeout(2000);
-    }
+    // Navigate to article
+    await session.open(url, headed);
+    await session.wait(2000);
 
+    // Get snapshot to check if signed in
+    let snapshot = await session.snapshot();
+    
     // Check if signed in
-    const loginBtn = page.locator('button:has-text("Login")');
-    const loginCount = await loginBtn.count();
-    if (loginCount > 0) {
-      try {
-        if (await loginBtn.first().isVisible()) {
-          result.message = "Not signed in to Grokipedia";
-          return result;
-        }
-      } catch {}
+    const loginRef = findRefByText(snapshot, "Login", { partial: true });
+    if (loginRef) {
+      result.message = "Not signed in to Grokipedia";
+      return result;
     }
 
-    // Select the text using JavaScript with fuzzy matching and cross-node support
-    const selected = await page.evaluate((textToFind: string) => {
-      // Normalize text for matching: collapse whitespace, normalize quotes/dashes
-      const normalizeText = (text: string): string => {
-        return text
-          .replace(/[\u2018\u2019\u201C\u201D]/g, (c) => 
-            c === '\u2018' || c === '\u2019' ? "'" : '"'
-          ) // Smart quotes to straight
-          .replace(/[\u2013\u2014]/g, '-') // Em/en dashes to hyphen
-          .replace(/\s+/g, ' ') // Collapse whitespace
-          .trim();
-      };
+    // Select the text using JavaScript with fuzzy matching
+    // This uses eval to run the selection logic in the browser
+    const selectScript = `
+      (function(textToFind) {
+        // Normalize text for matching
+        function normalizeText(text) {
+          return text
+            .replace(/[\\u2018\\u2019\\u201C\\u201D]/g, function(c) {
+              return c === '\\u2018' || c === '\\u2019' ? "'" : '"';
+            })
+            .replace(/[\\u2013\\u2014]/g, '-')
+            .replace(/\\s+/g, ' ')
+            .trim();
+        }
 
-      // Build a map from normalized index to original position (node + offset)
-      interface TextPosition {
-        node: Text;
-        offset: number;
-      }
-      
-      interface TextMap {
-        normalized: string;
-        positions: TextPosition[]; // positions[i] = position of normalized char i in DOM
-      }
-
-      // Build a virtual text buffer from all text nodes with position mapping
-      const buildTextMap = (): TextMap => {
-        const positions: TextPosition[] = [];
-        let normalized = '';
-        
-        const walker = document.createTreeWalker(
-          document.body,
-          NodeFilter.SHOW_TEXT,
-          null
-        );
-
-        let node;
-        let lastWasSpace = true; // Start true to trim leading space
-        
-        while ((node = walker.nextNode())) {
-          const textNode = node as Text;
-          const parent = textNode.parentElement;
-          if (parent && parent.closest("script,style,noscript")) {
-            continue;
-          }
+        function buildTextMap() {
+          var positions = [];
+          var normalized = '';
           
-          const text = textNode.textContent || "";
+          var walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+            null
+          );
+
+          var node;
+          var lastWasSpace = true;
           
-          for (let i = 0; i < text.length; i++) {
-            let char = text[i];
-            
-            // Normalize character
-            if (char === '\u2018' || char === '\u2019') {
-              char = "'";
-            } else if (char === '\u201C' || char === '\u201D') {
-              char = '"';
-            } else if (char === '\u2013' || char === '\u2014') {
-              char = '-';
+          while ((node = walker.nextNode())) {
+            var textNode = node;
+            var parent = textNode.parentElement;
+            if (parent && parent.closest("script,style,noscript")) {
+              continue;
             }
             
-            // Handle whitespace collapsing
-            if (/\s/.test(char)) {
-              if (!lastWasSpace) {
-                normalized += ' ';
-                positions.push({ node: textNode, offset: i });
-                lastWasSpace = true;
+            var text = textNode.textContent || "";
+            
+            for (var i = 0; i < text.length; i++) {
+              var char = text[i];
+              
+              if (char === '\\u2018' || char === '\\u2019') {
+                char = "'";
+              } else if (char === '\\u201C' || char === '\\u201D') {
+                char = '"';
+              } else if (char === '\\u2013' || char === '\\u2014') {
+                char = '-';
               }
-              // Skip additional whitespace chars (collapse)
-            } else {
-              normalized += char;
-              positions.push({ node: textNode, offset: i });
-              lastWasSpace = false;
+              
+              if (/\\s/.test(char)) {
+                if (!lastWasSpace) {
+                  normalized += ' ';
+                  positions.push({ node: textNode, offset: i });
+                  lastWasSpace = true;
+                }
+              } else {
+                normalized += char;
+                positions.push({ node: textNode, offset: i });
+                lastWasSpace = false;
+              }
             }
           }
-        }
-        
-        // Trim trailing space
-        if (normalized.endsWith(' ')) {
-          normalized = normalized.slice(0, -1);
-          positions.pop();
-        }
-        
-        return { normalized, positions };
-      };
-
-      // Create a selection range from normalized start/end indices
-      const selectFromMap = (map: TextMap, startIdx: number, endIdx: number): boolean => {
-        if (startIdx < 0 || endIdx > map.positions.length || startIdx >= endIdx) {
-          return false;
-        }
-        
-        const startPos = map.positions[startIdx];
-        const endPos = map.positions[endIdx - 1];
-        
-        if (!startPos || !endPos) {
-          return false;
-        }
-        
-        const range = document.createRange();
-        range.setStart(startPos.node, startPos.offset);
-        // End offset is +1 to include the character
-        range.setEnd(endPos.node, endPos.offset + 1);
-        
-        const selection = window.getSelection();
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-        return true;
-      };
-
-      const normalizedSearch = normalizeText(textToFind);
-      
-      // Strategy 1: Try exact match in single text node first (fast path)
-      const tryExactMatch = (): boolean => {
-        const walker = document.createTreeWalker(
-          document.body,
-          NodeFilter.SHOW_TEXT,
-          null
-        );
-
-        let node;
-        while ((node = walker.nextNode())) {
-          const parent = node.parentElement;
-          if (parent && parent.closest("script,style,noscript")) {
-            continue;
+          
+          if (normalized.endsWith(' ')) {
+            normalized = normalized.slice(0, -1);
+            positions.pop();
           }
-          const textContent = node.textContent || "";
-          const index = textContent.indexOf(textToFind);
+          
+          return { normalized: normalized, positions: positions };
+        }
+
+        function selectFromMap(map, startIdx, endIdx) {
+          if (startIdx < 0 || endIdx > map.positions.length || startIdx >= endIdx) {
+            return false;
+          }
+          
+          var startPos = map.positions[startIdx];
+          var endPos = map.positions[endIdx - 1];
+          
+          if (!startPos || !endPos) {
+            return false;
+          }
+          
+          var range = document.createRange();
+          range.setStart(startPos.node, startPos.offset);
+          range.setEnd(endPos.node, endPos.offset + 1);
+          
+          var selection = window.getSelection();
+          if (selection) {
+            selection.removeAllRanges();
+            selection.addRange(range);
+          }
+          return true;
+        }
+
+        var normalizedSearch = normalizeText(textToFind);
+        
+        // Try exact match first
+        function tryExactMatch() {
+          var walker = document.createTreeWalker(
+            document.body,
+            NodeFilter.SHOW_TEXT,
+            null
+          );
+
+          var node;
+          while ((node = walker.nextNode())) {
+            var parent = node.parentElement;
+            if (parent && parent.closest("script,style,noscript")) {
+              continue;
+            }
+            var textContent = node.textContent || "";
+            var index = textContent.indexOf(textToFind);
+            if (index !== -1) {
+              var range = document.createRange();
+              range.setStart(node, index);
+              range.setEnd(node, index + textToFind.length);
+              var selection = window.getSelection();
+              if (selection) {
+                selection.removeAllRanges();
+                selection.addRange(range);
+              }
+              return true;
+            }
+          }
+          return false;
+        }
+
+        function tryCrossNodeMatch() {
+          var map = buildTextMap();
+          var index = map.normalized.indexOf(normalizedSearch);
           if (index !== -1) {
-            const range = document.createRange();
-            range.setStart(node, index);
-            range.setEnd(node, index + textToFind.length);
-            const selection = window.getSelection();
-            selection?.removeAllRanges();
-            selection?.addRange(range);
-            return true;
+            return selectFromMap(map, index, index + normalizedSearch.length);
           }
+          return false;
         }
-        return false;
-      };
 
-      // Strategy 2: Cross-node normalized match using text map
-      const tryCrossNodeMatch = (): boolean => {
-        const map = buildTextMap();
-        const index = map.normalized.indexOf(normalizedSearch);
-        if (index !== -1) {
-          return selectFromMap(map, index, index + normalizedSearch.length);
-        }
-        return false;
-      };
-
-      // Strategy 3: Cross-node partial match (first 50 chars)
-      const tryCrossNodePartialMatch = (): boolean => {
-        const shortSearch = normalizedSearch.substring(0, 50);
-        if (shortSearch.length < 15) return false;
-        
-        const map = buildTextMap();
-        const index = map.normalized.indexOf(shortSearch);
-        if (index !== -1) {
-          // Try to select the full length if possible, otherwise just what we found
-          const endIdx = Math.min(index + normalizedSearch.length, map.positions.length);
-          return selectFromMap(map, index, endIdx);
-        }
-        return false;
-      };
-
-      // Strategy 4: Cross-node case-insensitive match
-      const tryCrossNodeCaseInsensitive = (): boolean => {
-        const lowerSearch = normalizedSearch.toLowerCase();
-        const map = buildTextMap();
-        const index = map.normalized.toLowerCase().indexOf(lowerSearch);
-        if (index !== -1) {
-          return selectFromMap(map, index, index + normalizedSearch.length);
-        }
-        return false;
-      };
-
-      // Strategy 5: Fuzzy match - find best substring match
-      const tryFuzzyMatch = (): boolean => {
-        if (normalizedSearch.length < 20) return false;
-        
-        const map = buildTextMap();
-        const words = normalizedSearch.split(' ').filter(w => w.length > 3);
-        if (words.length < 2) return false;
-        
-        // Try to find a sequence of words
-        const firstWord = words[0].toLowerCase();
-        const lowerContent = map.normalized.toLowerCase();
-        
-        let searchStart = 0;
-        while (searchStart < lowerContent.length) {
-          const wordIdx = lowerContent.indexOf(firstWord, searchStart);
-          if (wordIdx === -1) break;
-          
-          // Check if subsequent words appear nearby
-          let matchEnd = wordIdx + firstWord.length;
-          let matchedWords = 1;
-          
-          for (let i = 1; i < words.length && matchedWords === i; i++) {
-            const nextWord = words[i].toLowerCase();
-            // Look within a reasonable window (100 chars)
-            const windowEnd = Math.min(matchEnd + 100, lowerContent.length);
-            const window = lowerContent.substring(matchEnd, windowEnd);
-            const nextIdx = window.indexOf(nextWord);
-            if (nextIdx !== -1) {
-              matchEnd = matchEnd + nextIdx + nextWord.length;
-              matchedWords++;
-            }
+        function tryCrossNodeCaseInsensitive() {
+          var lowerSearch = normalizedSearch.toLowerCase();
+          var map = buildTextMap();
+          var index = map.normalized.toLowerCase().indexOf(lowerSearch);
+          if (index !== -1) {
+            return selectFromMap(map, index, index + normalizedSearch.length);
           }
-          
-          // If we matched at least 60% of words, use this
-          if (matchedWords >= words.length * 0.6) {
-            return selectFromMap(map, wordIdx, matchEnd);
-          }
-          
-          searchStart = wordIdx + 1;
+          return false;
         }
+
+        if (tryExactMatch()) return true;
+        if (tryCrossNodeMatch()) return true;
+        if (tryCrossNodeCaseInsensitive()) return true;
         
         return false;
-      };
+      })(${JSON.stringify(textToSelect)})
+    `;
+    const selected = await session.eval(selectScript);
 
-      // Try strategies in order
-      if (tryExactMatch()) return true;
-      if (tryCrossNodeMatch()) return true;
-      if (tryCrossNodePartialMatch()) return true;
-      if (tryCrossNodeCaseInsensitive()) return true;
-      if (tryFuzzyMatch()) return true;
-      
-      return false;
-    }, textToSelect);
-
-    if (!selected) {
+    if (selected !== "true") {
       result.message = `Could not find text: ${textToSelect.substring(0, 50)}...`;
       return result;
     }
 
     // Trigger selection event
-    await page.evaluate(() => {
-      document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-    });
-    await page.waitForTimeout(500);
+    await session.eval(`document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }))`);
+    await session.wait(500);
 
-    // Click Suggest Edit button
-    const clicked = await page.evaluate(() => {
-      const buttons = document.querySelectorAll("button");
-      for (const btn of buttons) {
-        const text = (btn.textContent || "").toLowerCase();
-        if (
-          text.includes("suggest edit") ||
-          (text.includes("suggest") && text.includes("edit"))
-        ) {
-          btn.click();
-          return true;
-        }
-      }
-      return false;
-    });
+    // Get new snapshot and find Suggest Edit button
+    snapshot = await session.snapshot();
+    
+    // Look for Suggest Edit button
+    const suggestEditRef = findRefByText(snapshot, "Suggest Edit", { partial: true }) ||
+                           findRefByText(snapshot, "suggest edit", { partial: true });
 
-    if (!clicked) {
+    if (!suggestEditRef) {
       result.message = "Could not find Suggest Edit button";
       return result;
     }
 
-    await page.waitForTimeout(1000);
+    await session.click(suggestEditRef);
+    await session.wait(1000);
 
-    // Fill in summary - wait for textarea to appear
-    try {
-      const summaryInput = page.locator("textarea").first();
-      await summaryInput.waitFor({ state: "visible", timeout: 10000 });
-      await summaryInput.fill(summary);
-      await page.waitForTimeout(300);
-    } catch (e) {
-      result.message = `Edit form did not appear: ${e}`;
+    // Get new snapshot to find form elements
+    snapshot = await session.snapshot();
+
+    // Find textarea for summary
+    const textareaRefs = findRefsByPattern(snapshot, /textbox|textarea/i);
+    if (textareaRefs.length === 0) {
+      result.message = "Edit form did not appear";
       return result;
     }
 
+    // Fill in the summary
+    await session.fill(textareaRefs[0].ref, summary);
+    await session.wait(300);
+
     // Fill in correction if provided
-    if (correction) {
-      try {
-        const expandBtn = page.locator('button:has-text("Edit content")');
-        if ((await expandBtn.count()) > 0) {
-          await expandBtn.first().click();
-          await page.waitForTimeout(500);
-        }
-        const contentTextarea = page.locator("textarea").nth(1);
-        if ((await contentTextarea.count()) > 0) {
-          await contentTextarea.fill(correction);
-        }
-      } catch {
-        // Continue without correction text
+    if (correction && textareaRefs.length > 1) {
+      // Try to expand content editing if needed
+      snapshot = await session.snapshot();
+      const editContentRef = findRefByText(snapshot, "Edit content", { partial: true });
+      if (editContentRef) {
+        await session.click(editContentRef);
+        await session.wait(500);
+        snapshot = await session.snapshot();
+      }
+
+      const allTextareas = findRefsByPattern(snapshot, /textbox|textarea/i);
+      if (allTextareas.length > 1) {
+        await session.fill(allTextareas[1].ref, correction);
       }
     }
 
     // Add sources if provided
     if (sources && sources.length > 0) {
-      try {
-        for (let i = 0; i < sources.length; i++) {
-          if (i > 0) {
-            const addBtn = page.locator('button:has-text("Add another")');
-            if ((await addBtn.count()) > 0) {
-              await addBtn.click();
-              await page.waitForTimeout(300);
-            }
-          }
-          const sourceInput = page
-            .locator('input[placeholder*="http"], input[placeholder*="source"]')
-            .last();
-          if ((await sourceInput.count()) > 0) {
-            await sourceInput.fill(sources[i]);
-            await page.waitForTimeout(200);
+      for (let i = 0; i < sources.length; i++) {
+        if (i > 0) {
+          snapshot = await session.snapshot();
+          const addAnotherRef = findRefByText(snapshot, "Add another", { partial: true });
+          if (addAnotherRef) {
+            await session.click(addAnotherRef);
+            await session.wait(300);
           }
         }
-      } catch {
-        // Continue without sources
+        
+        snapshot = await session.snapshot();
+        // Find input fields - look for input[text] elements specifically
+        const inputRefs = findRefsByPattern(snapshot, /input.*\[text\]/i);
+        if (inputRefs.length > 0) {
+          // Use the last input field (newest one added)
+          await session.fill(inputRefs[inputRefs.length - 1].ref, sources[i]);
+          await session.wait(200);
+        }
       }
     }
 
-    // Submit
-    const submitBtn = page.locator(
-      'button:has-text("Submit Edit"), button:has-text("Submit")'
-    );
-    if ((await submitBtn.count()) > 0) {
-      await submitBtn.first().click();
-      await page.waitForTimeout(2000);
+    // Find and click Submit button
+    snapshot = await session.snapshot();
+    const submitRef = findRefByText(snapshot, "Submit Edit", { partial: true }) ||
+                      findRefByText(snapshot, "Submit", { partial: true });
+
+    if (submitRef) {
+      await session.click(submitRef);
+      await session.wait(2000);
       result.success = true;
       result.message = "Edit submitted successfully";
     } else {
