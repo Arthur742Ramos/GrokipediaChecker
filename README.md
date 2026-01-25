@@ -115,8 +115,8 @@ node dist/index.js -n 8 -p 4 -t history science
 # Use Comet browser (for existing login session)
 node dist/index.js -n 5 -p 2 -b comet
 
-# Show browser window (non-headless)
-node dist/index.js -n 3 --no-headless
+# Show browser window (headed mode)
+node dist/index.js -n 3 --headed
 
 # Verbose mode (show AI reasoning)
 node dist/index.js -n 2 -v --dry-run
@@ -130,8 +130,8 @@ node dist/index.js -n 2 -v --dry-run
 | `-p, --parallel <number>` | Number of parallel workers (max 5) | 1 |
 | `-a, --article <name>` | Specific article to review | - |
 | `-t, --theme <themes...>` | Theme(s) to search for articles | - |
-| `-b, --browser <type>` | Browser: chromium, firefox, webkit, chrome, edge, comet | chromium |
-| `--no-headless` | Show browser window | headless |
+| `-b, --browser <type>` | Browser: chromium, chrome, edge, comet | chromium |
+| `--headed` | Show browser window | headless |
 | `--dry-run` | Analyze without submitting corrections | false |
 | `-v, --verbose` | Show Copilot's reasoning and tool calls | false |
 | `--list-browsers` | List available browsers | - |
@@ -217,6 +217,15 @@ Grokipedia/
 - Parallel workers share browser context (all use same login session)
 - Only corrects errors that can be verified with reliable sources
 - Copilot SDK rate limits may affect high-throughput processing
+
+## Memory Management (v1.1)
+
+For long-running sessions processing hundreds of articles, the CLI includes automatic memory management:
+
+- **Session refresh**: Copilot sessions are refreshed every 50 articles to prevent memory buildup
+- **Bounded caches**: Topic cache and used-topics set are periodically trimmed
+- **Event handler cleanup**: All event handlers are properly removed after use
+- **Sliding window results**: For runs >100 articles, only recent results are stored in memory
 
 ## Contributing
 

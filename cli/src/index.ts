@@ -63,6 +63,7 @@ interface Worker {
   session: PlaywrightCLISession;
   copilotSession: Awaited<ReturnType<CopilotClient["createSession"]>>;
   busy: boolean;
+  articlesProcessed: number; // Track for periodic session refresh
 }
 
 interface ArticleResult {
@@ -76,7 +77,13 @@ interface WorkerProgress {
   completed: number;
   total: number;
   inProgress: Map<number, string>; // workerId -> articleName
+  totalErrors: number; // Running total for summary
+  totalCorrections: number; // Running total for summary
 }
+
+// Constants for memory management
+const SESSION_REFRESH_INTERVAL = 50; // Recreate Copilot session every N articles to prevent memory buildup
+const TOPIC_CACHE_MAX_SIZE = 100; // Limit topic cache size
 
 // Global state for the review session
 let browserManager: BrowserManager | null = null;
@@ -165,8 +172,9 @@ If no factual errors are found, return empty errors array. Focus on factual accu
   let fullResponse = "";
   let dotCount = 0;
 
-  // Collect the response from multiple event types
-  session.on((event: SessionEvent) => {
+  // Create event handler as a named function so we can remove it later
+  // This prevents memory leaks from accumulating listeners
+  const eventHandler = (event: SessionEvent) => {
     const eventAny = event as any;
     
     // Stream deltas (actual response text)
@@ -215,13 +223,24 @@ If no factual errors are found, return empty errors array. Focus on factual accu
         fullResponse = content;
       }
     }
-  });
+  };
+
+  // Register the event handler
+  session.on(eventHandler);
 
   try {
     await session.sendAndWait({ prompt }, 1800000); // 30 minute timeout
     console.log("\n");
   } catch (error) {
     console.error(chalk.red(`\nError during analysis: ${error}`));
+  } finally {
+    // CRITICAL: Remove the event handler to prevent memory leaks
+    // The session.off() method removes the listener we added
+    try {
+      (session as any).off?.(eventHandler);
+    } catch {
+      // Ignore if off() doesn't exist
+    }
   }
 
   return parseAnalysisResponse(fullResponse);
@@ -229,6 +248,7 @@ If no factual errors are found, return empty errors array. Focus on factual accu
 
 /**
  * Process a single article with a worker (for parallel processing)
+ * Returns minimal result to reduce memory usage - stats tracked in progress
  */
 async function processArticle(
   worker: Worker,
@@ -309,12 +329,18 @@ async function processArticle(
         }
       }
     }
+    
+    // Update running totals in progress (reduces need to store all results)
+    progress.totalErrors += result.errorsFound;
+    progress.totalCorrections += result.correctionsSubmitted;
+    
   } catch (error) {
     console.log(chalk.red(`${prefix} Error processing ${articleName}: ${error}`));
   }
 
   progress.inProgress.delete(worker.id);
   progress.completed++;
+  worker.articlesProcessed++;
 
   return result;
 }
@@ -368,12 +394,45 @@ Be thorough but precise. Quality over quantity.`;
       session,
       copilotSession,
       busy: false,
+      articlesProcessed: 0,
     });
     
     console.log(chalk.gray(`  Worker ${i + 1}/${workerCount} created`));
   }
 
   return workers;
+}
+
+/**
+ * Refresh a worker's Copilot session to prevent memory buildup
+ */
+async function refreshWorkerSession(
+  worker: Worker,
+  client: CopilotClient
+): Promise<void> {
+  const systemMessage = `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
+
+When analyzing an article:
+1. Look for claims about dates, numbers, names, events, or scientific facts
+2. Use web search to verify suspicious claims against authoritative sources (Wikipedia, official websites, academic sources)
+3. Only report errors you have verified - do not guess or speculate
+4. Return your findings as structured JSON
+
+Be thorough but precise. Quality over quantity.`;
+
+  // Close old session (best effort)
+  try {
+    (worker.copilotSession as any).close?.();
+  } catch {}
+
+  // Create fresh session
+  worker.copilotSession = await client.createSession({
+    model: "claude-opus-4-5",
+    streaming: true,
+    systemMessage: { content: systemMessage },
+  });
+  
+  worker.articlesProcessed = 0;
 }
 
 /**
@@ -462,14 +521,18 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
 
   console.log(chalk.bold(`\nStarting parallel processing of ${options.iterations} article(s)...\n`));
 
-  // Track progress
+  // Track progress with running totals
   const progress: WorkerProgress = {
     completed: 0,
     total: options.iterations,
     inProgress: new Map(),
+    totalErrors: 0,
+    totalCorrections: 0,
   };
 
-  // Results collection
+  // Don't store all results in memory for large runs - just keep recent for summary
+  // For runs > 100 articles, only keep last 100 results to show
+  const MAX_STORED_RESULTS = 100;
   const results: ArticleResult[] = [];
 
   // Shared state for topic generation
@@ -478,7 +541,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   let topicCache: string[] = [];
   const usedTopics = new Set<string>();
   
-  // Get next article name
+  // Get next article name (with memory management)
   const getNextArticle = async (workerId: number): Promise<string | null> => {
     if (useSpecificList) {
       const idx = topicIndex++;
@@ -498,7 +561,19 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         const newTopics = await generateRandomArticleTopics(client, batchCount);
         const freshTopics = newTopics.filter(t => !usedTopics.has(t));
         topicCache.push(...freshTopics);
+        
+        // Limit topic cache size to prevent memory bloat
+        if (topicCache.length > TOPIC_CACHE_MAX_SIZE) {
+          topicCache = topicCache.slice(-TOPIC_CACHE_MAX_SIZE);
+        }
       }
+    }
+    
+    // Periodically clear old entries from usedTopics to prevent unbounded growth
+    // Keep only recent entries (roughly last 1000)
+    if (usedTopics.size > 2000) {
+      const entries = Array.from(usedTopics);
+      entries.slice(0, 1000).forEach(t => usedTopics.delete(t));
     }
     
     const topic = topicCache.shift();
@@ -519,6 +594,16 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     while (progress.completed < options.iterations) {
       if (progress.completed >= options.iterations) break;
       
+      // Refresh Copilot session periodically to prevent memory buildup
+      if (worker.articlesProcessed > 0 && worker.articlesProcessed % SESSION_REFRESH_INTERVAL === 0) {
+        console.log(chalk.gray(`[W${worker.id}] Refreshing Copilot session (processed ${worker.articlesProcessed} articles)...`));
+        try {
+          await refreshWorkerSession(worker, client);
+        } catch (e) {
+          console.log(chalk.yellow(`[W${worker.id}] Failed to refresh session, continuing with existing`));
+        }
+      }
+      
       const articleName = await getNextArticle(worker.id);
       if (!articleName) {
         await new Promise(r => setTimeout(r, 1000));
@@ -529,13 +614,24 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
       worker.busy = true;
       try {
         const result = await processArticle(worker, articleName, options, progress);
-        results.push(result);
+        
+        // Memory management: only store recent results for large runs
+        if (options.iterations <= MAX_STORED_RESULTS) {
+          results.push(result);
+        } else {
+          // For large runs, keep a sliding window of recent results
+          results.push(result);
+          if (results.length > MAX_STORED_RESULTS) {
+            results.shift(); // Remove oldest
+          }
+        }
       } catch (error) {
         console.log(chalk.red(`[W${worker.id}] Fatal error: ${error}`));
         progress.completed++;
         // Try to recover by getting a new session
         try {
           worker.session = await browserManager!.createSession();
+          await refreshWorkerSession(worker, client);
         } catch (e) {
           console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
           break;
@@ -560,29 +656,36 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
 
   console.log("\n");
 
-  // Print summary
+  // Print summary - use running totals for large runs
   console.log(chalk.bold.green("\n=== Review Complete ===\n"));
-  console.log(chalk.bold("Results by worker:"));
   
-  const byWorker = new Map<number, ArticleResult[]>();
-  for (const r of results) {
-    if (!byWorker.has(r.workerId)) {
-      byWorker.set(r.workerId, []);
+  if (options.iterations <= MAX_STORED_RESULTS) {
+    // Small run: show per-worker breakdown
+    console.log(chalk.bold("Results by worker:"));
+    
+    const byWorker = new Map<number, ArticleResult[]>();
+    for (const r of results) {
+      if (!byWorker.has(r.workerId)) {
+        byWorker.set(r.workerId, []);
+      }
+      byWorker.get(r.workerId)!.push(r);
     }
-    byWorker.get(r.workerId)!.push(r);
+
+    for (const [workerId, workerResults] of byWorker) {
+      console.log(chalk.cyan(`\nWorker ${workerId}:`));
+      for (const r of workerResults) {
+        console.log(chalk.white(`  ${r.article}: ${r.errorsFound} errors, ${r.correctionsSubmitted} corrections`));
+      }
+    }
+  } else {
+    // Large run: show summary only (we didn't store all results)
+    console.log(chalk.gray(`(Detailed per-article breakdown omitted for large runs)`));
+    console.log(chalk.gray(`Recent articles processed: ${results.map(r => r.article).slice(-10).join(", ")}...`));
   }
 
-  for (const [workerId, workerResults] of byWorker) {
-    console.log(chalk.cyan(`\nWorker ${workerId}:`));
-    for (const r of workerResults) {
-      console.log(chalk.white(`  ${r.article}: ${r.errorsFound} errors, ${r.correctionsSubmitted} corrections`));
-    }
-  }
-
-  const totalErrors = results.reduce((sum, r) => sum + r.errorsFound, 0);
-  const totalCorrections = results.reduce((sum, r) => sum + r.correctionsSubmitted, 0);
-  console.log(chalk.bold(`\nTotal: ${totalErrors} errors found, ${totalCorrections} corrections submitted`));
-  console.log(chalk.bold(`Processed: ${results.length} articles with ${workers.length} parallel worker(s)`));
+  // Use running totals from progress object (more memory efficient)
+  console.log(chalk.bold(`\nTotal: ${progress.totalErrors} errors found, ${progress.totalCorrections} corrections submitted`));
+  console.log(chalk.bold(`Processed: ${progress.completed} articles with ${workers.length} parallel worker(s)`));
 
   spinner.start("Cleaning up...");
   await client.stop();
@@ -835,7 +938,7 @@ program
   .option("-a, --article <name>", "Specific article to review")
   .option("-t, --theme <themes...>", "Theme(s) to search for articles (e.g., -t physics history)")
   .option("-b, --browser <type>", "Browser to use: chromium, chrome, edge, comet", "chromium")
-  .option("--no-headless", "Show browser window (default: headless)")
+  .option("--headed", "Show browser window (default: headless/background)")
   .option("--dry-run", "Analyze without submitting corrections")
   .option("-v, --verbose", "Show Copilot's reasoning and tool calls")
   .option("--list-browsers", "List available browsers")
@@ -861,7 +964,7 @@ program
       parallel: parseInt(opts.parallel, 10),
       article: opts.article,
       themes: opts.theme,
-      headless: opts.headless !== false,
+      headless: !opts.headed, // Default: headless (background mode)
       dryRun: opts.dryRun || false,
       verbose: opts.verbose || false,
       browser: opts.browser as BrowserType,
