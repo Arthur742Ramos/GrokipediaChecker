@@ -31,50 +31,114 @@ export interface PlaywrightCLIOptions {
   cdpPort?: number;
 }
 
-// Track CDP browser processes
-let cdpProcess: ChildProcess | null = null;
-let cdpPort: number = 9224;
+// Track CDP browser processes per port
+const cdpProcesses: Map<number, ChildProcess> = new Map();
+let nextCdpPort: number = 9224;
+
+// Mutex for serializing CDP browser launches (prevents race conditions)
+let cdpLaunchMutex: Promise<void> = Promise.resolve();
+
+/**
+ * Acquire the CDP launch mutex to serialize browser launches
+ */
+function acquireCdpLaunchMutex(): Promise<() => void> {
+  let release: () => void;
+  const previousMutex = cdpLaunchMutex;
+  cdpLaunchMutex = new Promise((resolve) => {
+    release = resolve;
+  });
+  return previousMutex.then(() => release!);
+}
 
 function portInUse(port: number): Promise<boolean> {
+  // Try both IPv4 and IPv6
   return new Promise((resolve) => {
-    const socket = new net.Socket();
-    socket.setTimeout(1000);
-    socket.on("connect", () => {
-      socket.destroy();
-      resolve(true);
-    });
-    socket.on("timeout", () => {
-      socket.destroy();
-      resolve(false);
-    });
-    socket.on("error", () => {
-      socket.destroy();
-      resolve(false);
-    });
-    socket.connect(port, "127.0.0.1");
+    let resolved = false;
+    let attempts = 0;
+    const maxAttempts = 2;
+    
+    const tryConnect = (host: string) => {
+      const socket = new net.Socket();
+      socket.setTimeout(1000);
+      socket.on("connect", () => {
+        socket.destroy();
+        if (!resolved) {
+          resolved = true;
+          resolve(true);
+        }
+      });
+      socket.on("timeout", () => {
+        socket.destroy();
+        attempts++;
+        if (attempts >= maxAttempts && !resolved) {
+          resolved = true;
+          resolve(false);
+        }
+      });
+      socket.on("error", () => {
+        socket.destroy();
+        attempts++;
+        if (attempts >= maxAttempts && !resolved) {
+          resolved = true;
+          resolve(false);
+        }
+      });
+      socket.connect(port, host);
+    };
+    
+    // Try both IPv4 and IPv6
+    tryConnect("127.0.0.1");
+    tryConnect("::1");
   });
 }
 
 function waitForCdp(port: number, timeout: number = 20000): Promise<boolean> {
   return new Promise((resolve) => {
     const start = Date.now();
+    let attemptCount = 0;
+    
+    // Try both localhost (which handles both IPv4/IPv6) and explicit addresses
+    const hosts = ["localhost", "127.0.0.1", "[::1]"];
+    let hostIndex = 0;
+    
     const check = () => {
+      attemptCount++;
+      const currentHost = hosts[hostIndex];
+      hostIndex = (hostIndex + 1) % hosts.length;
+      
       const req = http.request(
         {
-          hostname: "127.0.0.1",
+          hostname: currentHost.replace(/^\[|\]$/g, ""), // Remove brackets for http module
           port,
           path: "/json/version",
           method: "GET",
-          timeout: 2000,
+          timeout: 3000, // Increased per-request timeout
+          family: currentHost === "[::1]" ? 6 : (currentHost === "127.0.0.1" ? 4 : undefined),
         },
         (res) => {
-          res.on("data", () => {});
-          res.on("end", () => resolve(true));
+          let data = "";
+          res.on("data", (chunk) => { data += chunk; });
+          res.on("end", () => {
+            // Verify we got valid JSON response (CDP is truly ready)
+            try {
+              JSON.parse(data);
+              resolve(true);
+            } catch {
+              // Got response but not valid JSON yet, keep trying
+              if (Date.now() - start < timeout) {
+                setTimeout(check, 500);
+              } else {
+                resolve(false);
+              }
+            }
+          });
         }
       );
       req.on("error", () => {
         if (Date.now() - start < timeout) {
-          setTimeout(check, 500);
+          // Exponential backoff: start at 300ms, max at 1000ms
+          const delay = Math.min(300 * Math.pow(1.2, Math.min(attemptCount, 10)), 1000);
+          setTimeout(check, delay);
         } else {
           resolve(false);
         }
@@ -114,7 +178,8 @@ export class PlaywrightCLISession {
     this.headed = options.headed || false;
     this.sessionDir = path.join(SESSIONS_DIR, sessionName);
     this.browserType = options.browserType || "chromium";
-    this.cdpPort = options.cdpPort || 9224;
+    // Assign a unique CDP port for each session
+    this.cdpPort = options.cdpPort || nextCdpPort++;
     this.useCdp = ["comet", "chrome", "edge"].includes(this.browserType);
     
     // Ensure session directory exists
@@ -125,6 +190,7 @@ export class PlaywrightCLISession {
 
   /**
    * Launch CDP browser (Comet, Chrome, Edge)
+   * Uses a mutex to serialize browser launches and prevent race conditions
    */
   private async launchCdpBrowser(): Promise<Browser> {
     const executablePath = BROWSER_PATHS[this.browserType];
@@ -133,53 +199,153 @@ export class PlaywrightCLISession {
       throw new Error(`Browser ${this.browserType} not found at ${executablePath}`);
     }
 
-    // Use browser's native user data directory for existing login sessions
-    const userDataDir = this.browserType === "comet" 
-      ? path.join(os.homedir(), "Library/Application Support/Comet")
-      : this.browserType === "chrome"
-      ? path.join(os.homedir(), "Library/Application Support/Google/Chrome")
-      : path.join(os.homedir(), "Library/Application Support/Microsoft Edge");
-
-    // Check if CDP port is already in use
-    const portUsed = await portInUse(this.cdpPort);
-
-    if (!portUsed) {
-      const args = [
-        `--remote-debugging-port=${this.cdpPort}`,
-        `--user-data-dir=${userDataDir}`,
-        "--no-first-run",
-        "--no-default-browser-check",
-      ];
-
-      if (!this.headed) {
-        args.push("--headless=new");
-      }
-
-      args.push("about:blank");
-
-      console.log(`Launching ${this.browserType} browser...`);
-      cdpProcess = spawn(executablePath, args, {
-        stdio: "ignore",
-        detached: true,
-      });
-
-      // Wait for browser to start
-      await new Promise((r) => setTimeout(r, 2000));
-
-      const ready = await waitForCdp(this.cdpPort, 25000);
-      if (!ready) {
-        if (cdpProcess) {
-          try {
-            cdpProcess.kill();
-          } catch {}
+    // Acquire mutex to serialize browser launches
+    // This prevents race conditions when multiple workers launch simultaneously
+    const releaseMutex = await acquireCdpLaunchMutex();
+    
+    try {
+      // Use a COPY of browser's profile in a temp directory per session to avoid conflicts
+      // This preserves login from the original profile while allowing parallel instances
+      const originalProfileDir = this.browserType === "comet" 
+        ? path.join(os.homedir(), "Library/Application Support/Comet")
+        : this.browserType === "chrome"
+        ? path.join(os.homedir(), "Library/Application Support/Google/Chrome")
+        : path.join(os.homedir(), "Library/Application Support/Microsoft Edge");
+      
+      // Use session-specific temp directory with cookies copied from original
+      const userDataDir = path.join(this.sessionDir, "browser-profile");
+      
+      // Create the profile directory and copy essential login data if it doesn't exist
+      if (!fs.existsSync(userDataDir)) {
+        fs.mkdirSync(userDataDir, { recursive: true });
+        
+        // Copy cookies and login data from original profile
+        // Small delay to avoid file lock contention with other workers
+        await new Promise((r) => setTimeout(r, 100));
+        
+        const filesToCopy = ["Cookies", "Login Data", "Web Data"];
+        const defaultDir = path.join(userDataDir, "Default");
+        fs.mkdirSync(defaultDir, { recursive: true });
+        
+        for (const file of filesToCopy) {
+          const src = path.join(originalProfileDir, "Default", file);
+          const dst = path.join(defaultDir, file);
+          if (fs.existsSync(src)) {
+            try {
+              fs.copyFileSync(src, dst);
+            } catch (e) {
+              // Ignore copy errors - file might be locked
+              console.log(`Note: Could not copy ${file} (may be locked)`);
+            }
+          }
         }
-        throw new Error(`${this.browserType} browser CDP not responding`);
       }
-    } else {
-      console.log(`Connecting to existing ${this.browserType} on port ${this.cdpPort}...`);
-    }
 
-    return await chromium.connectOverCDP(`http://127.0.0.1:${this.cdpPort}`, { timeout: 15000 });
+      // Check if CDP port is already in use
+      const portUsed = await portInUse(this.cdpPort);
+
+      if (!portUsed) {
+        const args = [
+          `--remote-debugging-port=${this.cdpPort}`,
+          `--user-data-dir=${userDataDir}`,
+          "--no-first-run",
+          "--no-default-browser-check",
+          // Disable GPU to reduce startup time and resource contention
+          "--disable-gpu",
+          // Disable features that may conflict with parallel instances
+          "--disable-background-networking",
+          "--disable-default-apps",
+          "--disable-extensions",
+          "--disable-sync",
+          // Use a unique crash dump directory per instance
+          `--crash-dumps-dir=${path.join(userDataDir, "crashes")}`,
+        ];
+
+        if (!this.headed) {
+          args.push("--headless=new");
+        }
+
+        args.push("about:blank");
+
+        console.log(`Launching ${this.browserType} browser on port ${this.cdpPort}...`);
+        
+        // Spawn with pipe to capture any immediate errors
+        const proc = spawn(executablePath, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+        });
+        
+        // Track if process exits early (error)
+        let processExitedEarly = false;
+        let exitCode: number | null = null;
+        let stderrOutput = "";
+        
+        proc.on("exit", (code) => {
+          processExitedEarly = true;
+          exitCode = code;
+        });
+        
+        proc.stderr?.on("data", (data) => {
+          stderrOutput += data.toString();
+        });
+        
+        // Unref to allow parent process to exit independently
+        proc.unref();
+        
+        cdpProcesses.set(this.cdpPort, proc);
+
+        // Wait for browser to start - give more time for initial startup
+        // Stagger wait time based on port to reduce resource contention
+        const baseWait = 3000;
+        const staggerDelay = (this.cdpPort - 9224) * 1000; // Extra 1s per instance
+        await new Promise((r) => setTimeout(r, baseWait + staggerDelay));
+        
+        // Check if process died early
+        if (processExitedEarly) {
+          console.log(`Warning: ${this.browserType} process exited with code ${exitCode}`);
+          if (stderrOutput) {
+            console.log(`  stderr: ${stderrOutput.substring(0, 200)}`);
+          }
+          cdpProcesses.delete(this.cdpPort);
+          throw new Error(`${this.browserType} browser process exited immediately (code ${exitCode})`);
+        }
+
+        // Wait for CDP with longer timeout for parallel launches
+        const ready = await waitForCdp(this.cdpPort, 45000);
+        if (!ready) {
+          const proc = cdpProcesses.get(this.cdpPort);
+          if (proc) {
+            try {
+              proc.kill();
+            } catch {}
+            cdpProcesses.delete(this.cdpPort);
+          }
+          throw new Error(`${this.browserType} browser CDP not responding on port ${this.cdpPort}`);
+        }
+        
+        // Additional stabilization delay after CDP is ready
+        await new Promise((r) => setTimeout(r, 500));
+      } else {
+        console.log(`Connecting to existing ${this.browserType} on port ${this.cdpPort}...`);
+      }
+
+      // Try localhost first (resolves to both IPv4/IPv6), then specific addresses
+      const hosts = ["localhost", "127.0.0.1", "[::1]"];
+      let lastError: Error | null = null;
+      
+      for (const host of hosts) {
+        try {
+          return await chromium.connectOverCDP(`http://${host}:${this.cdpPort}`, { timeout: 10000 });
+        } catch (err) {
+          lastError = err as Error;
+          // Continue trying next host
+        }
+      }
+      throw lastError || new Error(`Could not connect to CDP on port ${this.cdpPort}`);
+    } finally {
+      // Release mutex to allow next browser to launch
+      releaseMutex();
+    }
   }
 
   /**
@@ -193,7 +359,7 @@ export class PlaywrightCLISession {
     if (!needsReconnect && this.page) {
       try {
         // Quick check if page is still responsive
-        await this.page.evaluate(() => true);
+        await this.page.evaluate("true");
       } catch {
         needsReconnect = true;
         this.page = null;
@@ -304,40 +470,42 @@ export class PlaywrightCLISession {
     const page = await this.ensureBrowser();
     
     // Build a simple accessibility-style snapshot
-    const snapshot = await page.evaluate(() => {
-      const elements: string[] = [];
-      let refCounter = 1;
-      
-      const processElement = (el: Element, depth: number = 0) => {
-        const tag = el.tagName.toLowerCase();
-        const role = el.getAttribute("role") || "";
-        const text = (el as HTMLElement).innerText?.substring(0, 50) || "";
-        const type = (el as HTMLInputElement).type || "";
+    // Using string evaluation to avoid tsx bundler __name injection
+    const snapshot = await page.evaluate(`
+      (function() {
+        var elements = [];
+        var refCounter = 1;
         
-        // Only include interactive elements
-        const interactiveRoles = ["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem"];
-        const interactiveTags = ["button", "a", "input", "textarea", "select"];
-        
-        if (interactiveTags.includes(tag) || interactiveRoles.includes(role)) {
-          const ref = `e${refCounter++}`;
-          let desc = `- ${role || tag}`;
-          if (text) desc += ` "${text.replace(/\n/g, " ").trim()}"`;
-          if (type) desc += ` [${type}]`;
-          desc += ` [ref=${ref}]`;
-          elements.push(desc);
+        function processElement(el, depth) {
+          depth = depth || 0;
+          var tag = el.tagName.toLowerCase();
+          var role = el.getAttribute("role") || "";
+          var text = (el.innerText || "").substring(0, 50);
+          var type = el.type || "";
+          
+          var interactiveRoles = ["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem"];
+          var interactiveTags = ["button", "a", "input", "textarea", "select"];
+          
+          if (interactiveTags.indexOf(tag) >= 0 || interactiveRoles.indexOf(role) >= 0) {
+            var ref = "e" + (refCounter++);
+            var desc = "- " + (role || tag);
+            if (text) desc += ' "' + text.replace(/\\n/g, " ").trim() + '"';
+            if (type) desc += " [" + type + "]";
+            desc += " [ref=" + ref + "]";
+            elements.push(desc);
+          }
+          
+          for (var i = 0; i < el.children.length; i++) {
+            processElement(el.children[i], depth + 1);
+          }
         }
         
-        // Process children
-        for (const child of el.children) {
-          processElement(child, depth + 1);
-        }
-      };
-      
-      processElement(document.body);
-      return elements.join("\n");
-    });
+        processElement(document.body);
+        return elements.join("\\n");
+      })()
+    `);
     
-    return snapshot;
+    return snapshot as string;
   }
 
   /**
@@ -357,32 +525,36 @@ export class PlaywrightCLISession {
     const index = parseInt(ref.replace("e", "")) - 1;
     
     // Find the element by index in interactive elements
-    const clicked = await page.evaluate((idx) => {
-      const elements: Element[] = [];
-      
-      const processElement = (el: Element) => {
-        const tag = el.tagName.toLowerCase();
-        const role = el.getAttribute("role") || "";
-        const interactiveRoles = ["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem"];
-        const interactiveTags = ["button", "a", "input", "textarea", "select"];
+    // Using string evaluation to avoid tsx bundler __name injection
+    const clicked = await page.evaluate(`
+      (function() {
+        var idx = ${index};
+        var elements = [];
         
-        if (interactiveTags.includes(tag) || interactiveRoles.includes(role)) {
-          elements.push(el);
+        function processElement(el) {
+          var tag = el.tagName.toLowerCase();
+          var role = el.getAttribute("role") || "";
+          var interactiveRoles = ["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem"];
+          var interactiveTags = ["button", "a", "input", "textarea", "select"];
+          
+          if (interactiveTags.indexOf(tag) >= 0 || interactiveRoles.indexOf(role) >= 0) {
+            elements.push(el);
+          }
+          
+          for (var i = 0; i < el.children.length; i++) {
+            processElement(el.children[i]);
+          }
         }
         
-        for (const child of el.children) {
-          processElement(child);
+        processElement(document.body);
+        
+        if (idx >= 0 && idx < elements.length) {
+          elements[idx].click();
+          return true;
         }
-      };
-      
-      processElement(document.body);
-      
-      if (idx >= 0 && idx < elements.length) {
-        (elements[idx] as HTMLElement).click();
-        return true;
-      }
-      return false;
-    }, index);
+        return false;
+      })()
+    `);
     
     if (!clicked) {
       throw new Error(`Element ${ref} not found`);
@@ -409,33 +581,37 @@ export class PlaywrightCLISession {
   /**
    * Helper to get element by index - uses same traversal order as snapshot()
    */
-  private async getElementByIndex(page: Page, index: number) {
+  private async getElementByIndex(page: Page, index: number): Promise<import("playwright").ElementHandle | null> {
     // Use the same document-order traversal as snapshot() to ensure consistency
-    const handle = await page.evaluateHandle((idx) => {
-      const interactiveRoles = ["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem"];
-      const interactiveTags = ["button", "a", "input", "textarea", "select"];
-      const elements: Element[] = [];
-      
-      const processElement = (el: Element) => {
-        const tag = el.tagName.toLowerCase();
-        const role = el.getAttribute("role") || "";
+    // Using string evaluation to avoid tsx bundler __name injection
+    const handle = await page.evaluateHandle(`
+      (function() {
+        var idx = ${index};
+        var interactiveRoles = ["button", "link", "textbox", "checkbox", "radio", "combobox", "menuitem"];
+        var interactiveTags = ["button", "a", "input", "textarea", "select"];
+        var elements = [];
         
-        if (interactiveTags.includes(tag) || interactiveRoles.includes(role)) {
-          elements.push(el);
+        function processElement(el) {
+          var tag = el.tagName.toLowerCase();
+          var role = el.getAttribute("role") || "";
+          
+          if (interactiveTags.indexOf(tag) >= 0 || interactiveRoles.indexOf(role) >= 0) {
+            elements.push(el);
+          }
+          
+          for (var i = 0; i < el.children.length; i++) {
+            processElement(el.children[i]);
+          }
         }
         
-        for (const child of el.children) {
-          processElement(child);
+        processElement(document.body);
+        
+        if (idx >= 0 && idx < elements.length) {
+          return elements[idx];
         }
-      };
-      
-      processElement(document.body);
-      
-      if (idx >= 0 && idx < elements.length) {
-        return elements[idx];
-      }
-      return null;
-    }, index);
+        return null;
+      })()
+    `);
     
     // Convert JSHandle to ElementHandle
     const element = handle.asElement();

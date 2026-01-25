@@ -339,14 +339,21 @@ When analyzing an article:
 
 Be thorough but precise. Quality over quantity.`;
 
-  // Create sessions sequentially with small delays
+  // Determine if we're using CDP browsers (need longer delays)
+  const isCdpBrowser = ["comet", "chrome", "edge"].includes(browserManager.browserType);
+
+  // Create sessions sequentially with appropriate delays
+  // CDP browsers need longer delays due to mutex and startup time
   for (let i = 0; i < workerCount; i++) {
     let session: PlaywrightCLISession;
     if (i === 0) {
       session = browserManager.session;
     } else {
-      // Small delay between session creations
-      await new Promise(r => setTimeout(r, 200));
+      // Longer delay between session creations for CDP browsers
+      // The mutex in launchCdpBrowser will serialize actual launches,
+      // but we still want some spacing to reduce overall contention
+      const delay = isCdpBrowser ? 1000 : 200;
+      await new Promise(r => setTimeout(r, delay));
       session = await browserManager.createSession();
     }
     
@@ -362,6 +369,8 @@ Be thorough but precise. Quality over quantity.`;
       copilotSession,
       busy: false,
     });
+    
+    console.log(chalk.gray(`  Worker ${i + 1}/${workerCount} created`));
   }
 
   return workers;
