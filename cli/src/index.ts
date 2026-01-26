@@ -225,8 +225,8 @@ If no factual errors are found, return empty errors array. Focus on factual accu
     }
   };
 
-  // Register the event handler
-  session.on(eventHandler);
+  // Register the event handler - session.on() returns an unsubscribe function
+  const unsubscribe = session.on(eventHandler);
 
   try {
     await session.sendAndWait({ prompt }, 1800000); // 30 minute timeout
@@ -234,13 +234,9 @@ If no factual errors are found, return empty errors array. Focus on factual accu
   } catch (error) {
     console.error(chalk.red(`\nError during analysis: ${error}`));
   } finally {
-    // CRITICAL: Remove the event handler to prevent memory leaks
-    // The session.off() method removes the listener we added
-    try {
-      (session as any).off?.(eventHandler);
-    } catch {
-      // Ignore if off() doesn't exist
-    }
+    // CRITICAL: Remove the event handler to prevent memory leaks and duplicated output
+    // The SDK's on() method returns an unsubscribe function we must call
+    unsubscribe();
   }
 
   return parseAnalysisResponse(fullResponse);
@@ -284,7 +280,9 @@ async function processArticle(
     }
 
     if (!article.signedIn && !options.dryRun) {
-      console.log(chalk.yellow(`${prefix} Warning: Not signed in`));
+      console.log(chalk.yellow(`${prefix} Warning: Not signed in to Grokipedia`));
+      console.log(chalk.dim(`${prefix}   The browser session may not have your login cookies.`));
+      console.log(chalk.dim(`${prefix}   Try: 1) Close other Comet instances, 2) Log in via the CLI browser window`));
     }
 
     // Analyze with Copilot
@@ -439,8 +437,9 @@ Be thorough but precise. Quality over quantity.`;
  * Display progress bar
  */
 function displayProgress(progress: WorkerProgress): void {
-  const pct = Math.round((progress.completed / progress.total) * 100);
-  const bar = "█".repeat(Math.floor(pct / 5)) + "░".repeat(20 - Math.floor(pct / 5));
+  const pct = Math.min(100, Math.round((progress.completed / progress.total) * 100));
+  const filled = Math.min(20, Math.floor(pct / 5));
+  const bar = "█".repeat(filled) + "░".repeat(20 - filled);
   const inProgressList = Array.from(progress.inProgress.values()).join(", ");
   process.stdout.write(
     `\r${chalk.cyan(`[${bar}] ${pct}% (${progress.completed}/${progress.total})`)} ${chalk.gray(inProgressList.substring(0, 40))}     `
@@ -812,6 +811,8 @@ Be thorough but precise. Quality over quantity.`,
 
     if (!article.signedIn && !options.dryRun) {
       console.log(chalk.yellow("Warning: Not signed in to Grokipedia. Edit submissions may fail."));
+      console.log(chalk.dim("  The browser session may not have your login cookies."));
+      console.log(chalk.dim("  Try: 1) Close other Comet instances, 2) Log in via the CLI browser window"));
     }
 
     // Analyze with Copilot

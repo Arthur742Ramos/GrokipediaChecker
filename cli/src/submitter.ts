@@ -43,15 +43,83 @@ export async function submitEdit(
     await session.open(url, headed);
     await session.wait(2000);
 
-    // Get snapshot to check if signed in
-    let snapshot = await session.snapshot();
+    // Check if signed in using JavaScript evaluation
+    // This is more reliable than snapshot-based text matching
+    const loginCheckScript = `
+      (function() {
+        // Check for login link pointing to the auth endpoint
+        // The login link has text "Login" and points to check-login or sign-in
+        var loginLinks = document.querySelectorAll('a[href*="check-login"], a[href*="sign-in"]');
+        var hasLoginLink = false;
+        for (var i = 0; i < loginLinks.length; i++) {
+          var text = (loginLinks[i].textContent || '').trim().toLowerCase();
+          if (text === 'login' || text === 'log in' || text === 'sign in') {
+            hasLoginLink = true;
+            break;
+          }
+        }
+        
+        // Check for logged-in indicators - be specific to avoid false positives
+        // Logout link should have "logout" or "sign-out" in the path (not just anywhere in URL)
+        var allLinks = document.querySelectorAll('a');
+        var hasLogoutLink = false;
+        var hasProfileLink = false;
+        
+        for (var i = 0; i < allLinks.length; i++) {
+          var href = (allLinks[i].getAttribute('href') || '').toLowerCase();
+          var text = (allLinks[i].textContent || '').trim().toLowerCase();
+          
+          // Check for logout - must be explicit logout action
+          if (href.includes('/logout') || href.includes('/sign-out') || 
+              text === 'logout' || text === 'log out' || text === 'sign out') {
+            hasLogoutLink = true;
+          }
+          
+          // Check for profile link - must be a path like /profile or /user/xxx, not accounts.x.ai
+          if ((href.includes('/profile') || href.includes('/user/')) && 
+              !href.includes('accounts.x.ai') && !href.includes('check-login')) {
+            hasProfileLink = true;
+          }
+        }
+        
+        // Check for user avatar
+        var userAvatar = document.querySelector('[data-testid="avatar"], [data-testid="user-avatar"], img.avatar, img.user-avatar');
+        var hasAvatar = !!userAvatar;
+        
+        var hasLoggedInIndicator = hasLogoutLink || hasProfileLink || hasAvatar;
+        
+        // User is signed in if:
+        // - There's no login link to auth endpoint, OR
+        // - There are logged-in indicators present
+        var signedIn = !hasLoginLink || hasLoggedInIndicator;
+        
+        return JSON.stringify({
+          signedIn: signedIn,
+          hasLoginLink: hasLoginLink,
+          hasLoggedInIndicator: hasLoggedInIndicator
+        });
+      })()
+    `;
     
-    // Check if signed in
-    const loginRef = findRefByText(snapshot, "Login", { partial: true });
-    if (loginRef) {
+    let isSignedIn = false;
+    try {
+      const loginCheckResult = await session.eval(loginCheckScript);
+      const parsed = JSON.parse(loginCheckResult);
+      isSignedIn = parsed.signedIn;
+    } catch {
+      // Fallback to snapshot-based detection if eval fails
+      const snapshot = await session.snapshot();
+      const loginRef = findRefByText(snapshot, "Login", { partial: true });
+      isSignedIn = loginRef === null;
+    }
+    
+    if (!isSignedIn) {
       result.message = "Not signed in to Grokipedia";
       return result;
     }
+
+    // Get snapshot for subsequent operations
+    let snapshot = await session.snapshot();
 
     // Select the text using JavaScript with fuzzy matching
     // This uses eval to run the selection logic in the browser

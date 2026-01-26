@@ -5,7 +5,7 @@
  */
 
 import { chromium, Browser, BrowserContext, Page } from "playwright";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, ChildProcess, execSync } from "child_process";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
@@ -39,6 +39,124 @@ let nextCdpPort: number = 9224;
 let cdpLaunchMutex: Promise<void> = Promise.resolve();
 
 /**
+ * Check if a browser profile is locked (another instance is using it)
+ */
+function isProfileLocked(profileDir: string): boolean {
+  const lockFile = path.join(profileDir, "SingletonLock");
+  try {
+    // On macOS, SingletonLock is a symlink to the process that holds the lock
+    const stat = fs.lstatSync(lockFile);
+    if (stat.isSymbolicLink()) {
+      // Check if the process is still running
+      try {
+        const target = fs.readlinkSync(lockFile);
+        // Target format is like "hostname-pid" or just a process identifier
+        const pidMatch = target.match(/-(\d+)$/);
+        if (pidMatch) {
+          const pid = parseInt(pidMatch[1]);
+          try {
+            process.kill(pid, 0); // Check if process exists
+            return true; // Process is running, profile is locked
+          } catch {
+            // Process not running, stale lock
+            return false;
+          }
+        }
+      } catch {
+        // Can't read symlink, assume locked
+        return true;
+      }
+    }
+    return true; // Lock file exists
+  } catch {
+    return false; // No lock file
+  }
+}
+
+/**
+ * Check if a browser process is running by name (excludes zombie processes)
+ */
+function isBrowserRunning(browserType: BrowserType): boolean {
+  try {
+    const processName = browserType === "comet" ? "Comet" : 
+                        browserType === "chrome" ? "Google Chrome" : 
+                        "Microsoft Edge";
+    // Use ps to get process state and filter out zombies (state Z or UE)
+    // ps output: PID STATE COMMAND
+    const result = execSync(
+      `ps -eo pid,state,comm | grep -E "^\\s*[0-9]+\\s+[^Z].*${processName}$" | grep -v grep`,
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+    // Filter out zombie states (Z, UE, etc.)
+    const lines = result.trim().split('\n').filter(line => {
+      const state = line.trim().split(/\s+/)[1] || '';
+      // Exclude zombie (Z) and uninterruptible exit (UE) states
+      return !state.includes('Z') && !state.includes('UE');
+    });
+    return lines.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Try to find an existing CDP endpoint for a running browser
+ */
+async function findExistingCdpEndpoint(startPort: number = 9222, endPort: number = 9230): Promise<number | null> {
+  for (let port = startPort; port <= endPort; port++) {
+    try {
+      const response = await new Promise<string | null>((resolve) => {
+        const req = http.request({
+          hostname: "127.0.0.1",
+          port,
+          path: "/json/version",
+          method: "GET",
+          timeout: 1000,
+        }, (res) => {
+          let data = "";
+          res.on("data", chunk => data += chunk);
+          res.on("end", () => resolve(data));
+        });
+        req.on("error", () => resolve(null));
+        req.on("timeout", () => { req.destroy(); resolve(null); });
+        req.end();
+      });
+      
+      if (response) {
+        try {
+          JSON.parse(response);
+          return port;
+        } catch {}
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// Shared browser connection pool for tab multiplexing
+// Key: browserType (comet, chrome, edge), Value: shared Browser connection
+interface SharedBrowserConnection {
+  browser: Browser;
+  context: BrowserContext;
+  port: number;
+  refCount: number;
+}
+const sharedBrowserConnections: Map<string, SharedBrowserConnection> = new Map();
+let sharedBrowserMutex: Promise<void> = Promise.resolve();
+
+/**
+ * Acquire the shared browser mutex to serialize browser connection setup
+ */
+function acquireSharedBrowserMutex(): Promise<() => void> {
+  let release: () => void;
+  const previousMutex = sharedBrowserMutex;
+  sharedBrowserMutex = new Promise((resolve) => {
+    release = resolve;
+  });
+  return previousMutex.then(() => release!);
+}
+
+/**
  * Acquire the CDP launch mutex to serialize browser launches
  */
 function acquireCdpLaunchMutex(): Promise<() => void> {
@@ -48,6 +166,569 @@ function acquireCdpLaunchMutex(): Promise<() => void> {
     release = resolve;
   });
   return previousMutex.then(() => release!);
+}
+
+/**
+ * Copy cookies from existing browser contexts to a new context.
+ * This is necessary when connecting via CDP to an existing browser - 
+ * new contexts don't automatically inherit cookies from existing tabs.
+ * 
+ * Uses CDP's Network.getAllCookies to get all cookies at the browser level,
+ * then uses Network.setCookie to set them in the browser's cookie jar
+ * (not just Playwright's context).
+ */
+async function copyCookiesFromBrowser(browser: Browser, targetContext: BrowserContext): Promise<void> {
+  try {
+    // Get cookies from all existing contexts
+    const allCookies: Array<{
+      name: string;
+      value: string;
+      domain: string;
+      path: string;
+      expires: number;
+      httpOnly: boolean;
+      secure: boolean;
+      sameSite: "Strict" | "Lax" | "None";
+    }> = [];
+    
+    // First, try to get cookies from the default context's pages via CDP
+    // This gets cookies at the browser level, including session cookies
+    const contexts = browser.contexts();
+    let cdpSessionForSetting: any = null;
+    
+    for (const ctx of contexts) {
+      if (ctx === targetContext) continue; // Skip target context
+      
+      const pages = ctx.pages();
+      if (pages.length > 0) {
+        // Use CDP session to get ALL cookies (including httpOnly)
+        try {
+          const cdpSession = await pages[0].context().newCDPSession(pages[0]);
+          const { cookies } = await cdpSession.send("Network.getAllCookies") as { 
+            cookies: Array<{
+              name: string;
+              value: string;
+              domain: string;
+              path: string;
+              expires: number;
+              httpOnly: boolean;
+              secure: boolean;
+              sameSite: string;
+            }>;
+          };
+          
+          for (const cookie of cookies) {
+            // Filter for Grokipedia and auth cookies (x.ai is the auth provider)
+            if (cookie.domain.includes("grokipedia") || cookie.domain.includes("wikipedia") ||
+                cookie.domain.includes("x.ai") || cookie.domain.includes("xai")) {
+              allCookies.push({
+                name: cookie.name,
+                value: cookie.value,
+                domain: cookie.domain,
+                path: cookie.path || "/",
+                expires: cookie.expires || -1,
+                httpOnly: cookie.httpOnly || false,
+                secure: cookie.secure || false,
+                sameSite: (cookie.sameSite as "Strict" | "Lax" | "None") || "Lax",
+              });
+            }
+          }
+          
+          cdpSessionForSetting = cdpSession;
+          break; // Got cookies from one page, that's enough
+        } catch (cdpErr) {
+          // CDP session failed, try context.cookies() as fallback
+          try {
+            const ctxCookies = await ctx.cookies();
+            for (const cookie of ctxCookies) {
+              if (cookie.domain.includes("grokipedia") || cookie.domain.includes("wikipedia") ||
+                  cookie.domain.includes("x.ai") || cookie.domain.includes("xai")) {
+                allCookies.push({
+                  name: cookie.name,
+                  value: cookie.value,
+                  domain: cookie.domain,
+                  path: cookie.path,
+                  expires: cookie.expires,
+                  httpOnly: cookie.httpOnly,
+                  secure: cookie.secure,
+                  sameSite: cookie.sameSite,
+                });
+              }
+            }
+          } catch {}
+        }
+      }
+    }
+    
+    if (allCookies.length > 0) {
+      console.log(`Copying ${allCookies.length} session cookies to new context...`);
+      
+      // Log cookie domains for debugging
+      const domains = [...new Set(allCookies.map(c => c.domain))];
+      console.log(`Cookie domains: ${domains.join(", ")}`);
+      
+      // First, try to set cookies via CDP Network.setCookie (writes to browser's cookie jar)
+      if (cdpSessionForSetting) {
+        for (const cookie of allCookies) {
+          try {
+            await cdpSessionForSetting.send("Network.setCookie", {
+              name: cookie.name,
+              value: cookie.value,
+              domain: cookie.domain,
+              path: cookie.path || "/",
+              expires: cookie.expires > 0 ? cookie.expires : undefined,
+              httpOnly: cookie.httpOnly || false,
+              secure: cookie.secure || false,
+              sameSite: cookie.sameSite || "Lax",
+            });
+          } catch {
+            // Individual cookie set might fail, continue
+          }
+        }
+        await cdpSessionForSetting.detach();
+      }
+      
+      // Also add to Playwright context
+      await targetContext.addCookies(allCookies);
+    } else {
+      console.log("No existing Grokipedia session cookies found in browser");
+    }
+  } catch (err) {
+    console.log(`Warning: Could not copy cookies: ${err}`);
+  }
+}
+
+/**
+ * Copy cookies from browser to context using CDP directly on the browser.
+ * This method creates a new page temporarily to access CDP.
+ */
+async function copyCookiesViaCDP(browser: Browser, targetContext: BrowserContext): Promise<void> {
+  let tempPage: Page | null = null;
+  
+  try {
+    // Create a temporary page in the default context to access CDP
+    const defaultContext = browser.contexts()[0];
+    if (!defaultContext || defaultContext === targetContext) {
+      // No other context to get cookies from, try creating temp page in target
+      tempPage = await targetContext.newPage();
+      const cdpSession = await tempPage.context().newCDPSession(tempPage);
+      
+      // Get all cookies via CDP
+      const { cookies } = await cdpSession.send("Storage.getCookies") as { 
+        cookies: Array<{
+          name: string;
+          value: string;
+          domain: string;
+          path: string;
+          expires: number;
+          httpOnly: boolean;
+          secure: boolean;
+          sameSite: string;
+        }>;
+      };
+      
+      await cdpSession.detach();
+      await tempPage.close();
+      tempPage = null;
+      
+      // Filter and add Grokipedia and auth cookies (x.ai is the auth provider)
+      const grokCookies = cookies.filter(c => 
+        c.domain.includes("grokipedia") || c.domain.includes("wikipedia") ||
+        c.domain.includes("x.ai") || c.domain.includes("xai")
+      ).map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path || "/",
+        expires: c.expires || -1,
+        httpOnly: c.httpOnly || false,
+        secure: c.secure || false,
+        sameSite: (c.sameSite as "Strict" | "Lax" | "None") || "Lax",
+      }));
+      
+      if (grokCookies.length > 0) {
+        console.log(`Copying ${grokCookies.length} session cookies via CDP...`);
+        await targetContext.addCookies(grokCookies);
+      }
+      return;
+    }
+    
+    // Use existing page from default context
+    const existingPages = defaultContext.pages();
+    if (existingPages.length > 0) {
+      const cdpSession = await existingPages[0].context().newCDPSession(existingPages[0]);
+      
+      const { cookies } = await cdpSession.send("Network.getAllCookies") as { 
+        cookies: Array<{
+          name: string;
+          value: string;
+          domain: string;
+          path: string;
+          expires: number;
+          httpOnly: boolean;
+          secure: boolean;
+          sameSite: string;
+        }>;
+      };
+      
+      await cdpSession.detach();
+      
+      // Filter for Grokipedia and auth cookies (x.ai is the auth provider)
+      const grokCookies = cookies.filter(c => 
+        c.domain.includes("grokipedia") || c.domain.includes("wikipedia") ||
+        c.domain.includes("x.ai") || c.domain.includes("xai")
+      ).map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path || "/",
+        expires: c.expires || -1,
+        httpOnly: c.httpOnly || false,
+        secure: c.secure || false,
+        sameSite: (c.sameSite as "Strict" | "Lax" | "None") || "Lax",
+      }));
+      
+      if (grokCookies.length > 0) {
+        console.log(`Copying ${grokCookies.length} session cookies via CDP...`);
+        await targetContext.addCookies(grokCookies);
+      }
+    }
+  } catch (err) {
+    console.log(`Warning: Could not copy cookies via CDP: ${err}`);
+  } finally {
+    if (tempPage) {
+      try { await tempPage.close(); } catch {}
+    }
+  }
+}
+
+/**
+ * Get or create a shared browser connection for tab multiplexing
+ * This allows multiple workers to share ONE browser instance with multiple tabs
+ * 
+ * SMART PROFILE HANDLING:
+ * 1. If CDP already available on port 9224, connect to it
+ * 2. If browser is running with profile lock, try other CDP ports or use temp profile
+ * 3. If profile is free, launch browser with original profile
+ */
+async function getSharedBrowserConnection(
+  browserType: BrowserType,
+  headed: boolean
+): Promise<SharedBrowserConnection> {
+  const releaseMutex = await acquireSharedBrowserMutex();
+  
+  try {
+    // Check if we already have a connection for this browser type
+    const existing = sharedBrowserConnections.get(browserType);
+    if (existing && existing.browser.isConnected()) {
+      existing.refCount++;
+      console.log(`Reusing shared ${browserType} browser connection (${existing.refCount} tabs)`);
+      return existing;
+    }
+    
+    // Need to launch a new shared browser
+    const executablePath = BROWSER_PATHS[browserType];
+    if (!executablePath || !fs.existsSync(executablePath)) {
+      throw new Error(`Browser ${browserType} not found at ${executablePath}`);
+    }
+    
+    // Use fixed port 9224 for the shared browser
+    const port = 9224;
+    
+    // Get original profile directory for auth
+    const originalProfileDir = browserType === "comet" 
+      ? path.join(os.homedir(), "Library/Application Support/Comet")
+      : browserType === "chrome"
+      ? path.join(os.homedir(), "Library/Application Support/Google/Chrome")
+      : path.join(os.homedir(), "Library/Application Support/Microsoft Edge");
+    
+    // Check if CDP port is already in use (browser might already be running)
+    const portUsed = await portInUse(port);
+    
+    if (!portUsed) {
+      // Check if profile is locked by another browser instance
+      const profileLocked = isProfileLocked(originalProfileDir);
+      const browserRunning = isBrowserRunning(browserType);
+      
+      if (profileLocked || browserRunning) {
+        console.log(`${browserType} profile is locked (browser running: ${browserRunning})`);
+        
+        // Strategy 1: Try to find an existing CDP endpoint on other ports
+        console.log("Searching for existing CDP endpoints...");
+        const existingPort = await findExistingCdpEndpoint(9222, 9230);
+        if (existingPort) {
+          console.log(`Found existing CDP on port ${existingPort}, connecting...`);
+          const browser = await chromium.connectOverCDP(`http://127.0.0.1:${existingPort}`, { timeout: 10000 });
+          
+          // Get the default context (where user's logged-in tabs live) or create new one
+          const existingContext = browser.contexts()[0];
+          let context: BrowserContext;
+          
+          if (existingContext) {
+            // Use the existing context - this shares cookies with user's tabs
+            context = existingContext;
+            console.log(`Using existing browser context with ${existingContext.pages().length} tabs`);
+            // Still need to sync cookies - Playwright context may not have all browser cookies
+            await copyCookiesFromBrowser(browser, context);
+          } else {
+            // Need to create a new context - copy cookies from browser
+            context = await browser.newContext();
+            console.log("Created new context, will copy session cookies...");
+            await copyCookiesFromBrowser(browser, context);
+          }
+          
+          const connection: SharedBrowserConnection = {
+            browser,
+            context,
+            port: existingPort,
+            refCount: 1,
+          };
+          
+          sharedBrowserConnections.set(browserType, connection);
+          console.log(`Connected to existing ${browserType} browser on port ${existingPort}`);
+          return connection;
+        }
+        
+        // Browser is running without CDP - automatically restart it with CDP enabled
+        // This is the only way to access the encrypted cookies on macOS
+        const browserName = browserType.charAt(0).toUpperCase() + browserType.slice(1);
+        console.log(`${browserName} is running without remote debugging. Restarting with CDP enabled...`);
+        
+        // Kill the existing browser process - try graceful first, then force
+        const processName = browserType === "comet" ? "Comet" : 
+                            browserType === "chrome" ? "Google Chrome" : 
+                            "Microsoft Edge";
+        
+        // First try graceful termination (SIGTERM)
+        try {
+          execSync(`pkill -x "${processName}"`, { stdio: "ignore" });
+          console.log(`Sent termination signal to ${browserName}...`);
+        } catch {
+          // pkill returns non-zero if no process found, which is fine
+        }
+        
+        // Wait for the browser to fully terminate and release the profile lock
+        let lockReleased = false;
+        const maxWait = 5000; // 5 seconds for graceful shutdown
+        const startTime = Date.now();
+        
+        while (!lockReleased && Date.now() - startTime < maxWait) {
+          await new Promise(r => setTimeout(r, 500));
+          // Check if profile is still locked
+          if (!isProfileLocked(originalProfileDir) && !isBrowserRunning(browserType)) {
+            lockReleased = true;
+          }
+        }
+        
+        // If still running, use SIGKILL (force kill)
+        if (!lockReleased) {
+          console.log(`${browserName} didn't terminate gracefully, using force kill...`);
+          try {
+            execSync(`pkill -9 -x "${processName}"`, { stdio: "ignore" });
+          } catch {
+            // Ignore errors
+          }
+          
+          // Wait another 3 seconds for forced termination
+          const forceStart = Date.now();
+          while (!lockReleased && Date.now() - forceStart < 3000) {
+            await new Promise(r => setTimeout(r, 500));
+            if (!isProfileLocked(originalProfileDir) && !isBrowserRunning(browserType)) {
+              lockReleased = true;
+            }
+          }
+        }
+        
+        if (!lockReleased) {
+          // Still can't kill it - throw an error
+          throw new Error(
+            `Could not terminate ${browserName}. Please close it manually and try again.\n` +
+            `If that doesn't work, try: kill -9 $(pgrep -x "${processName}")`
+          );
+        }
+        
+        console.log(`${browserName} terminated. Restarting with CDP...`);
+        
+        // Small delay to ensure filesystem is ready
+        await new Promise(r => setTimeout(r, 500));
+      }
+      
+      // Profile is now free (either was already free, or we just freed it), launch with CDP
+      const args = [
+          `--remote-debugging-port=${port}`,
+          `--user-data-dir=${originalProfileDir}`,
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-gpu",
+          "--disable-background-networking",
+          "--disable-default-apps",
+          "--disable-extensions",
+          "--disable-sync",
+          `--crash-dumps-dir=${path.join(originalProfileDir, "crashes")}`,
+        ];
+        
+        if (!headed) {
+          args.push("--headless=new");
+        }
+        
+        args.push("about:blank");
+        
+        console.log(`Launching shared ${browserType} browser on port ${port}...`);
+        
+        const proc = spawn(executablePath, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+        });
+        
+        let processExitedEarly = false;
+        let exitCode: number | null = null;
+        let stderrOutput = "";
+        
+        proc.on("exit", (code) => {
+          processExitedEarly = true;
+          exitCode = code;
+          // Clean up shared connection on exit
+          sharedBrowserConnections.delete(browserType);
+        });
+        
+        proc.stderr?.on("data", (data) => {
+          stderrOutput += data.toString();
+        });
+        
+        proc.unref();
+        cdpProcesses.set(port, proc);
+        
+        // Wait for browser to start
+        await new Promise((r) => setTimeout(r, 3000));
+        
+        if (processExitedEarly) {
+          console.log(`Warning: ${browserType} process exited with code ${exitCode}`);
+          if (stderrOutput) {
+            console.log(`  stderr: ${stderrOutput.substring(0, 200)}`);
+          }
+          cdpProcesses.delete(port);
+          throw new Error(`${browserType} browser process exited immediately (code ${exitCode})`);
+        }
+        
+        // Wait for CDP with longer timeout
+        const ready = await waitForCdp(port, 45000);
+        if (!ready) {
+          const proc = cdpProcesses.get(port);
+          if (proc) {
+            try { proc.kill(); } catch {}
+            cdpProcesses.delete(port);
+          }
+          throw new Error(`${browserType} browser CDP not responding on port ${port}`);
+        }
+        
+        await new Promise((r) => setTimeout(r, 500));
+    } else {
+      console.log(`Connecting to existing ${browserType} browser on port ${port}...`);
+    }
+    
+    // Connect to the browser via CDP
+    const hosts = ["localhost", "127.0.0.1", "[::1]"];
+    let browser: Browser | null = null;
+    let lastError: Error | null = null;
+    
+    for (const host of hosts) {
+      try {
+        browser = await chromium.connectOverCDP(`http://${host}:${port}`, { timeout: 10000 });
+        break;
+      } catch (err) {
+        lastError = err as Error;
+      }
+    }
+    
+    if (!browser) {
+      throw lastError || new Error(`Could not connect to CDP on port ${port}`);
+    }
+    
+    // Get the default context (where user's logged-in tabs live)
+    // IMPORTANT: For CDP connections, we MUST use the existing context to share cookies.
+    // Creating a new context with browser.newContext() creates an ISOLATED context
+    // that doesn't have access to the browser's cookie jar.
+    const existingContext = browser.contexts()[0];
+    let context: BrowserContext;
+    
+    if (existingContext) {
+      // Use the existing context - this shares cookies with user's tabs
+      context = existingContext;
+      const playwrightPageCount = existingContext.pages().length;
+      console.log(`Using existing browser context (Playwright sees ${playwrightPageCount} tabs)`);
+      
+      // Log existing page URLs for debugging
+      const pageUrls = existingContext.pages().map(p => {
+        try { return p.url(); } catch { return "<closed>"; }
+      });
+      if (pageUrls.length > 0) {
+        console.log(`Playwright-visible tabs: ${pageUrls.join(", ")}`);
+      }
+      
+      // Use CDP Target API to see the real tab count (Playwright misses existing tabs)
+      try {
+        const cdpSession = await browser.newBrowserCDPSession();
+        const { targetInfos } = await cdpSession.send("Target.getTargets") as { 
+          targetInfos: Array<{ type: string; url: string }> 
+        };
+        const pageTargets = targetInfos.filter(t => t.type === "page");
+        console.log(`CDP Target API sees ${pageTargets.length} actual browser tabs`);
+      } catch {
+        // CDP session might not be available in all cases
+      }
+      
+      // Still sync cookies via CDP to ensure browser's cookie jar is accessible
+      await copyCookiesFromBrowser(browser, context);
+    } else {
+      // No existing context - this means the browser was just launched
+      // For CDP connections, we CANNOT use browser.newContext() as it creates
+      // an isolated context. Instead, we need to create a page first to establish
+      // a default context, then use that.
+      console.log("No existing context found, creating default page to establish context...");
+      
+      // Create a page directly on the browser - this establishes a default context
+      // Note: For CDP connections, browser.newContext() creates isolated contexts,
+      // but pages created via context will share the browser's cookie jar
+      context = await browser.newContext();
+      console.log("Created new context, syncing session cookies...");
+      await copyCookiesFromBrowser(browser, context);
+    }
+    
+    const connection: SharedBrowserConnection = {
+      browser,
+      context,
+      port,
+      refCount: 1,
+    };
+    
+    sharedBrowserConnections.set(browserType, connection);
+    console.log(`Created shared ${browserType} browser connection`);
+    
+    return connection;
+  } finally {
+    releaseMutex();
+  }
+}
+
+/**
+ * Release a reference to a shared browser connection
+ */
+async function releaseSharedBrowserConnection(browserType: BrowserType): Promise<void> {
+  const releaseMutex = await acquireSharedBrowserMutex();
+  
+  try {
+    const connection = sharedBrowserConnections.get(browserType);
+    if (connection) {
+      connection.refCount--;
+      console.log(`Released shared ${browserType} browser connection (${connection.refCount} remaining)`);
+      
+      // Don't close the browser even when refCount hits 0
+      // Let it stay open for the duration of the session
+      // It will be cleaned up when the process exits
+    }
+  } finally {
+    releaseMutex();
+  }
 }
 
 function portInUse(port: number): Promise<boolean> {
@@ -161,6 +842,11 @@ function waitForCdp(port: number, timeout: number = 20000): Promise<boolean> {
  * Playwright CLI Session
  * Manages a persistent browser session with Playwright API
  * Supports both Chromium and CDP-based browsers (Comet, Chrome, Edge)
+ * 
+ * For CDP browsers (Comet, Chrome, Edge), uses tab multiplexing:
+ * - All sessions share ONE browser instance
+ * - Each session gets its own tab (page) in the shared browser
+ * - This avoids SingletonLock conflicts and shares auth
  */
 export class PlaywrightCLISession {
   private sessionName: string;
@@ -172,14 +858,16 @@ export class PlaywrightCLISession {
   private browserType: BrowserType;
   private cdpPort: number;
   private useCdp: boolean;
+  private useSharedConnection: boolean = false; // Track if using shared connection
 
   constructor(sessionName: string, options: Omit<PlaywrightCLIOptions, "session"> = {}) {
     this.sessionName = sessionName;
     this.headed = options.headed || false;
     this.sessionDir = path.join(SESSIONS_DIR, sessionName);
     this.browserType = options.browserType || "chromium";
-    // Assign a unique CDP port for each session
-    this.cdpPort = options.cdpPort || nextCdpPort++;
+    // For shared connections, we use port 9224
+    // Only assign unique port if not using shared connection (legacy fallback)
+    this.cdpPort = options.cdpPort || 9224;
     this.useCdp = ["comet", "chrome", "edge"].includes(this.browserType);
     
     // Ensure session directory exists
@@ -212,34 +900,9 @@ export class PlaywrightCLISession {
         ? path.join(os.homedir(), "Library/Application Support/Google/Chrome")
         : path.join(os.homedir(), "Library/Application Support/Microsoft Edge");
       
-      // Use session-specific temp directory with cookies copied from original
-      const userDataDir = path.join(this.sessionDir, "browser-profile");
-      
-      // Create the profile directory and copy essential login data if it doesn't exist
-      if (!fs.existsSync(userDataDir)) {
-        fs.mkdirSync(userDataDir, { recursive: true });
-        
-        // Copy cookies and login data from original profile
-        // Small delay to avoid file lock contention with other workers
-        await new Promise((r) => setTimeout(r, 100));
-        
-        const filesToCopy = ["Cookies", "Login Data", "Web Data"];
-        const defaultDir = path.join(userDataDir, "Default");
-        fs.mkdirSync(defaultDir, { recursive: true });
-        
-        for (const file of filesToCopy) {
-          const src = path.join(originalProfileDir, "Default", file);
-          const dst = path.join(defaultDir, file);
-          if (fs.existsSync(src)) {
-            try {
-              fs.copyFileSync(src, dst);
-            } catch (e) {
-              // Ignore copy errors - file might be locked
-              console.log(`Note: Could not copy ${file} (may be locked)`);
-            }
-          }
-        }
-      }
+      // Use original profile directly to preserve encrypted cookies/auth
+      // macOS encrypts cookies with Keychain - copying files doesn't preserve auth
+      const userDataDir = originalProfileDir;
 
       // Check if CDP port is already in use
       const portUsed = await portInUse(this.cdpPort);
@@ -349,7 +1012,147 @@ export class PlaywrightCLISession {
   }
 
   /**
+   * Find an existing page in the browser that's on a grokipedia domain.
+   * This is useful for CDP connections where we want to reuse a logged-in tab.
+   * 
+   * Uses CDP Target API directly because browser.contexts()[0].pages() doesn't
+   * see existing tabs when connecting to a browser via CDP - it only returns
+   * pages that Playwright created itself.
+   */
+  private async findExistingGrokipediaPage(): Promise<Page | null> {
+    if (!this.browser) return null;
+    
+    // First try the standard Playwright API (works for Playwright-created pages)
+    const contexts = this.browser.contexts();
+    for (const ctx of contexts) {
+      const pages = ctx.pages();
+      for (const page of pages) {
+        try {
+          const url = page.url();
+          if (url.includes("grokipedia.com") || url.includes("grokipedia")) {
+            console.log(`Found existing grokipedia page via Playwright API: ${url}`);
+            return page;
+          }
+        } catch {
+          // Page might be closed or inaccessible
+        }
+      }
+    }
+    
+    // For CDP connections, use Target API to find existing tabs that Playwright doesn't see
+    if (this.useCdp) {
+      try {
+        const page = await this.findGrokipediaPageViaCDP();
+        if (page) {
+          return page;
+        }
+      } catch (err) {
+        console.log(`CDP target search failed: ${err}`);
+      }
+    }
+    
+    return null;
+  }
+
+  /**
+   * Use CDP Target API to find and attach to existing grokipedia tabs.
+   * This is necessary because browser.contexts()[0].pages() only returns
+   * pages that Playwright created, not pre-existing browser tabs.
+   */
+  private async findGrokipediaPageViaCDP(): Promise<Page | null> {
+    if (!this.browser) return null;
+    
+    try {
+      // Create a browser-level CDP session to access Target domain
+      const cdpSession = await this.browser.newBrowserCDPSession();
+      
+      // Get all targets (pages, workers, etc.) from the browser
+      const { targetInfos } = await cdpSession.send("Target.getTargets") as { 
+        targetInfos: Array<{
+          targetId: string;
+          type: string;
+          title: string;
+          url: string;
+          attached: boolean;
+          browserContextId?: string;
+        }> 
+      };
+      
+      console.log(`CDP found ${targetInfos.length} total targets`);
+      
+      // Find page targets with grokipedia URLs
+      const grokipediaTargets = targetInfos.filter(target => 
+        target.type === "page" && 
+        (target.url.includes("grokipedia.com") || target.url.includes("grokipedia"))
+      );
+      
+      if (grokipediaTargets.length === 0) {
+        console.log("No grokipedia targets found via CDP");
+        // Log what we did find for debugging
+        const pageTargets = targetInfos.filter(t => t.type === "page");
+        if (pageTargets.length > 0) {
+          console.log(`Found ${pageTargets.length} page targets: ${pageTargets.map(t => t.url).slice(0, 5).join(", ")}${pageTargets.length > 5 ? "..." : ""}`);
+        }
+        return null;
+      }
+      
+      console.log(`Found ${grokipediaTargets.length} grokipedia target(s) via CDP`);
+      const target = grokipediaTargets[0];
+      console.log(`Attaching to target: ${target.url} (${target.targetId})`);
+      
+      // Attach to the target to get a session
+      const { sessionId } = await cdpSession.send("Target.attachToTarget", {
+        targetId: target.targetId,
+        flatten: true  // Required for modern CDP - creates a flat session hierarchy
+      }) as { sessionId: string };
+      
+      console.log(`Attached to target with sessionId: ${sessionId}`);
+      
+      // Now we need to get a Playwright Page from this target.
+      // The trick is that once we attach, the page should appear in contexts.
+      // We can also create a new page in the same context to trigger discovery.
+      
+      // Try to find the page in existing contexts again after attaching
+      const contexts = this.browser.contexts();
+      for (const ctx of contexts) {
+        const pages = ctx.pages();
+        for (const page of pages) {
+          try {
+            const url = page.url();
+            if (url.includes("grokipedia.com") || url.includes("grokipedia")) {
+              console.log(`Found grokipedia page after CDP attach: ${url}`);
+              return page;
+            }
+          } catch {
+            // Page might be closed or inaccessible
+          }
+        }
+      }
+      
+      // If the page still isn't visible via Playwright, we need a different approach.
+      // We'll use the CDP session to navigate our own page there, copying the session.
+      console.log("Target attached but page not visible to Playwright - will use new tab with synced cookies");
+      
+      // Detach from the target to clean up
+      try {
+        await cdpSession.send("Target.detachFromTarget", { sessionId });
+      } catch {
+        // Ignore detach errors
+      }
+      
+      return null;
+    } catch (err) {
+      console.log(`CDP target discovery failed: ${err}`);
+      return null;
+    }
+  }
+
+  /**
    * Ensure browser is launched and page is ready
+   * For CDP browsers, uses tab multiplexing (shared browser, separate tabs)
+   * 
+   * IMPORTANT: For CDP connections, we try to reuse an existing page that's
+   * already on grokipedia.com, as it will already have the session cookies.
    */
   private async ensureBrowser(): Promise<Page> {
     // Check if browser connection is still valid
@@ -367,21 +1170,44 @@ export class PlaywrightCLISession {
     }
     
     if (needsReconnect) {
-      // Clean up old connections
-      if (this.browser) {
+      // Clean up old page (but NOT the shared browser connection)
+      if (this.page) {
+        try {
+          await this.page.close();
+        } catch {}
+        this.page = null;
+      }
+      
+      // For shared connections, don't close the browser
+      if (!this.useSharedConnection && this.browser) {
         try {
           await this.browser.close();
         } catch {}
         this.browser = null;
         this.context = null;
-        this.page = null;
       }
       
       if (this.useCdp) {
-        // Use CDP for Comet/Chrome/Edge - preserves existing login
-        this.browser = await this.launchCdpBrowser();
-        this.context = this.browser.contexts()[0] || await this.browser.newContext();
-        this.page = await this.context.newPage();
+        // Use shared browser connection for CDP browsers (tab multiplexing)
+        // This ensures all workers share ONE browser instance with multiple tabs
+        const connection = await getSharedBrowserConnection(this.browserType, this.headed);
+        this.browser = connection.browser;
+        this.context = connection.context;
+        this.useSharedConnection = true;
+        
+        // Try to reuse an existing grokipedia page first - it will have the session
+        const existingPage = await this.findExistingGrokipediaPage();
+        if (existingPage) {
+          this.page = existingPage;
+          console.log("Reusing existing grokipedia tab with session");
+        } else {
+          // Create a new page (tab) in the shared context
+          this.page = await this.context.newPage();
+          
+          // For CDP connections, ensure cookies from existing browser session are available
+          // This handles the case where new pages don't automatically inherit all cookies
+          await this.syncCookiesFromBrowser();
+        }
       } else {
         // Use Playwright's bundled Chromium
         const storageStatePath = path.join(this.sessionDir, "storage-state.json");
@@ -433,6 +1259,108 @@ export class PlaywrightCLISession {
   }
 
   /**
+   * Sync cookies from the browser to the current page via CDP.
+   * When connecting to an existing browser via CDP, new pages may not automatically
+   * have access to all cookies from the browser's cookie jar. This method uses CDP
+   * to SET cookies directly in the browser's native cookie store (not just Playwright's
+   * context), ensuring they're available for navigations.
+   * 
+   * KEY INSIGHT: context.addCookies() only adds cookies to Playwright's isolated
+   * context storage. To make cookies work for new pages, we need to use CDP's
+   * Network.setCookie to add them to the browser's actual cookie jar.
+   */
+  private async syncCookiesFromBrowser(): Promise<void> {
+    if (!this.page || !this.browser || !this.useCdp) {
+      return;
+    }
+
+    try {
+      // Create a CDP session for this page
+      const cdpSession = await this.page.context().newCDPSession(this.page);
+      
+      // Get all cookies at the browser level using CDP
+      const { cookies } = await cdpSession.send("Network.getAllCookies") as { 
+        cookies: Array<{
+          name: string;
+          value: string;
+          domain: string;
+          path: string;
+          expires: number;
+          size: number;
+          httpOnly: boolean;
+          secure: boolean;
+          session: boolean;
+          sameSite?: string;
+          priority?: string;
+          sameParty?: boolean;
+          sourceScheme?: string;
+          sourcePort?: number;
+        }>;
+      };
+      
+      // Filter for Grokipedia-related cookies
+      const relevantCookies = cookies.filter(c => 
+        c.domain.includes("grokipedia") || 
+        c.domain.includes("wikipedia") ||
+        c.domain.includes("x.ai") ||
+        c.domain.includes("xai")
+      );
+      
+      if (relevantCookies.length > 0) {
+        console.log(`Found ${relevantCookies.length} session cookies in browser`);
+        
+        // Log cookie domains for debugging
+        const domains = [...new Set(relevantCookies.map(c => c.domain))];
+        console.log(`Cookie domains: ${domains.join(", ")}`);
+        
+        // Use CDP's Network.setCookie to set cookies directly in the browser's cookie jar
+        // This is more reliable than context.addCookies() for CDP connections
+        for (const cookie of relevantCookies) {
+          try {
+            await cdpSession.send("Network.setCookie", {
+              name: cookie.name,
+              value: cookie.value,
+              domain: cookie.domain,
+              path: cookie.path || "/",
+              expires: cookie.expires > 0 ? cookie.expires : undefined,
+              httpOnly: cookie.httpOnly || false,
+              secure: cookie.secure || false,
+              sameSite: (cookie.sameSite as "Strict" | "Lax" | "None") || "Lax",
+            });
+          } catch (setCookieErr) {
+            // Individual cookie set might fail, continue with others
+          }
+        }
+        
+        // Also add to Playwright context as backup
+        const cookiesToAdd = relevantCookies.map(c => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || "/",
+          expires: c.expires > 0 ? c.expires : undefined,
+          httpOnly: c.httpOnly || false,
+          secure: c.secure || false,
+          sameSite: (c.sameSite as "Strict" | "Lax" | "None") || "Lax",
+        }));
+        
+        try {
+          await this.context!.addCookies(cookiesToAdd);
+        } catch (addErr) {
+          // Context might already have these cookies, ignore errors
+        }
+      } else {
+        console.log("No Grokipedia session cookies found in browser - user may need to log in");
+      }
+      
+      await cdpSession.detach();
+    } catch (err) {
+      // Non-fatal - just log and continue
+      console.log(`Note: Could not sync cookies via CDP: ${err}`);
+    }
+  }
+
+  /**
    * Open a URL in the browser
    */
   async open(url: string, headed?: boolean): Promise<string> {
@@ -440,6 +1368,12 @@ export class PlaywrightCLISession {
       this.headed = headed;
     }
     const page = await this.ensureBrowser();
+    
+    // For CDP connections navigating to Grokipedia, ensure cookies are synced
+    if (this.useCdp && (url.includes("grokipedia") || url.includes("wikipedia"))) {
+      await this.syncCookiesFromBrowser();
+    }
+    
     await page.goto(url, { timeout: 60000 });
     
     // Wait for page to be ready
@@ -873,6 +1807,7 @@ export class PlaywrightCLISession {
 
   /**
    * Stop this session
+   * For shared connections (CDP browsers), only closes the page/tab, not the browser
    */
   async stop(): Promise<void> {
     await this.saveState();
@@ -882,13 +1817,18 @@ export class PlaywrightCLISession {
       } catch {}
       this.page = null;
     }
-    if (this.browser) {
+    
+    if (this.useSharedConnection) {
+      // For shared connections, release the reference but don't close the browser
+      await releaseSharedBrowserConnection(this.browserType);
+      // Don't null out browser/context since other sessions may be using them
+    } else if (this.browser) {
       try {
         await this.browser.close();
       } catch {}
       this.browser = null;
+      this.context = null;
     }
-    this.context = null;
   }
 
   /**

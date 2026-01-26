@@ -44,12 +44,75 @@ export async function fetchArticleContent(
     // Wait for page to load
     await session.wait(3000);
 
-    // Get a snapshot to check for Login button
-    const snapshot = await session.snapshot();
-    
-    // Check if signed in (no Login button visible)
-    const loginRef = findRefByText(snapshot, "Login", { partial: true });
-    result.signedIn = loginRef === null;
+    // Check if signed in using JavaScript evaluation
+    // This is more reliable than snapshot-based text matching because:
+    // 1. It checks for the actual login link href (not just text that contains "Login")
+    // 2. It also checks for logged-in indicators like logout links or user profile elements
+    const loginCheckScript = `
+      (function() {
+        // Check for login link pointing to the auth endpoint
+        // The login link has text "Login" and points to check-login or sign-in
+        var loginLinks = document.querySelectorAll('a[href*="check-login"], a[href*="sign-in"]');
+        var hasLoginLink = false;
+        for (var i = 0; i < loginLinks.length; i++) {
+          var text = (loginLinks[i].textContent || '').trim().toLowerCase();
+          if (text === 'login' || text === 'log in' || text === 'sign in') {
+            hasLoginLink = true;
+            break;
+          }
+        }
+        
+        // Check for logged-in indicators - be specific to avoid false positives
+        // Logout link should have "logout" or "sign-out" in the path (not just anywhere in URL)
+        var allLinks = document.querySelectorAll('a');
+        var hasLogoutLink = false;
+        var hasProfileLink = false;
+        
+        for (var i = 0; i < allLinks.length; i++) {
+          var href = (allLinks[i].getAttribute('href') || '').toLowerCase();
+          var text = (allLinks[i].textContent || '').trim().toLowerCase();
+          
+          // Check for logout - must be explicit logout action
+          if (href.includes('/logout') || href.includes('/sign-out') || 
+              text === 'logout' || text === 'log out' || text === 'sign out') {
+            hasLogoutLink = true;
+          }
+          
+          // Check for profile link - must be a path like /profile or /user/xxx, not accounts.x.ai
+          if ((href.includes('/profile') || href.includes('/user/')) && 
+              !href.includes('accounts.x.ai') && !href.includes('check-login')) {
+            hasProfileLink = true;
+          }
+        }
+        
+        // Check for user avatar
+        var userAvatar = document.querySelector('[data-testid="avatar"], [data-testid="user-avatar"], img.avatar, img.user-avatar');
+        var hasAvatar = !!userAvatar;
+        
+        var hasLoggedInIndicator = hasLogoutLink || hasProfileLink || hasAvatar;
+        
+        // User is signed in if:
+        // - There's no login link to auth endpoint, OR
+        // - There are logged-in indicators present
+        var signedIn = !hasLoginLink || hasLoggedInIndicator;
+        
+        return JSON.stringify({
+          signedIn: signedIn,
+          hasLoginLink: hasLoginLink,
+          hasLoggedInIndicator: hasLoggedInIndicator
+        });
+      })()
+    `;
+    const loginCheckResult = await session.eval(loginCheckScript);
+    try {
+      const parsed = JSON.parse(loginCheckResult);
+      result.signedIn = parsed.signedIn;
+    } catch {
+      // Fallback to snapshot-based detection if eval fails
+      const snapshot = await session.snapshot();
+      const loginRef = findRefByText(snapshot, "Login", { partial: true });
+      result.signedIn = loginRef === null;
+    }
 
     // Extract content using eval
     const contentScript = `
@@ -229,7 +292,8 @@ Return ONLY a valid JSON array of strings, like: ["Topic 1", "Topic 2", ...]`;
 
     let response = "";
 
-    session.on((event) => {
+    // Register handler and get unsubscribe function - MUST call unsubscribe after each batch
+    const unsubscribe = session.on((event) => {
       if (event.type === "assistant.message_delta") {
         const delta = event.data.deltaContent;
         if (delta) {
@@ -248,8 +312,12 @@ Return ONLY a valid JSON array of strings, like: ["Topic 1", "Topic 2", ...]`;
       await session.sendAndWait({ prompt }, 120000); // 2 minute timeout per batch
     } catch (error) {
       console.error(`Error generating topics batch ${batch + 1}: ${error}`);
+      unsubscribe(); // Clean up handler before continuing to next batch
       continue;
     }
+    
+    // Clean up the event handler to prevent accumulation
+    unsubscribe();
 
     // Parse the JSON array from the response
     try {
