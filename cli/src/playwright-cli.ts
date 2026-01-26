@@ -178,6 +178,7 @@ function acquireCdpLaunchMutex(): Promise<() => void> {
  * (not just Playwright's context).
  */
 async function copyCookiesFromBrowser(browser: Browser, targetContext: BrowserContext): Promise<void> {
+  let cdpSessionForSetting: any = null;
   try {
     // Get cookies from all existing contexts
     const allCookies: Array<{
@@ -194,7 +195,7 @@ async function copyCookiesFromBrowser(browser: Browser, targetContext: BrowserCo
     // First, try to get cookies from the default context's pages via CDP
     // This gets cookies at the browser level, including session cookies
     const contexts = browser.contexts();
-    let cdpSessionForSetting: any = null;
+    cdpSessionForSetting = null;
     
     for (const ctx of contexts) {
       if (ctx === targetContext) continue; // Skip target context
@@ -285,7 +286,6 @@ async function copyCookiesFromBrowser(browser: Browser, targetContext: BrowserCo
             // Individual cookie set might fail, continue
           }
         }
-        await cdpSessionForSetting.detach();
       }
       
       // Also add to Playwright context
@@ -295,6 +295,12 @@ async function copyCookiesFromBrowser(browser: Browser, targetContext: BrowserCo
     }
   } catch (err) {
     console.log(`Warning: Could not copy cookies: ${err}`);
+  } finally {
+    if (cdpSessionForSetting) {
+      try {
+        await cdpSessionForSetting.detach();
+      } catch {}
+    }
   }
 }
 
@@ -1062,9 +1068,10 @@ export class PlaywrightCLISession {
   private async findGrokipediaPageViaCDP(): Promise<Page | null> {
     if (!this.browser) return null;
     
+    let cdpSession: any = null;
     try {
       // Create a browser-level CDP session to access Target domain
-      const cdpSession = await this.browser.newBrowserCDPSession();
+      cdpSession = await this.browser.newBrowserCDPSession();
       
       // Get all targets (pages, workers, etc.) from the browser
       const { targetInfos } = await cdpSession.send("Target.getTargets") as { 
@@ -1144,6 +1151,12 @@ export class PlaywrightCLISession {
     } catch (err) {
       console.log(`CDP target discovery failed: ${err}`);
       return null;
+    } finally {
+      if (cdpSession) {
+        try {
+          await cdpSession.detach();
+        } catch {}
+      }
     }
   }
 
@@ -1195,19 +1208,13 @@ export class PlaywrightCLISession {
         this.context = connection.context;
         this.useSharedConnection = true;
         
-        // Try to reuse an existing grokipedia page first - it will have the session
-        const existingPage = await this.findExistingGrokipediaPage();
-        if (existingPage) {
-          this.page = existingPage;
-          console.log("Reusing existing grokipedia tab with session");
-        } else {
-          // Create a new page (tab) in the shared context
-          this.page = await this.context.newPage();
-          
-          // For CDP connections, ensure cookies from existing browser session are available
-          // This handles the case where new pages don't automatically inherit all cookies
-          await this.syncCookiesFromBrowser();
-        }
+        // Always create a new page (tab) in the shared context for isolation
+        // This avoids multiple workers sharing the same tab and closing user tabs
+        this.page = await this.context.newPage();
+
+        // For CDP connections, ensure cookies from existing browser session are available
+        // This handles the case where new pages don't automatically inherit all cookies
+        await this.syncCookiesFromBrowser();
       } else {
         // Use Playwright's bundled Chromium
         const storageStatePath = path.join(this.sessionDir, "storage-state.json");
@@ -1274,9 +1281,10 @@ export class PlaywrightCLISession {
       return;
     }
 
+    let cdpSession: any = null;
     try {
       // Create a CDP session for this page
-      const cdpSession = await this.page.context().newCDPSession(this.page);
+      cdpSession = await this.page.context().newCDPSession(this.page);
       
       // Get all cookies at the browser level using CDP
       const { cookies } = await cdpSession.send("Network.getAllCookies") as { 
@@ -1353,10 +1361,15 @@ export class PlaywrightCLISession {
         console.log("No Grokipedia session cookies found in browser - user may need to log in");
       }
       
-      await cdpSession.detach();
     } catch (err) {
       // Non-fatal - just log and continue
       console.log(`Note: Could not sync cookies via CDP: ${err}`);
+    } finally {
+      if (cdpSession) {
+        try {
+          await cdpSession.detach();
+        } catch {}
+      }
     }
   }
 

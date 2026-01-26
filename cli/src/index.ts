@@ -119,6 +119,18 @@ function parseAnalysisResponse(response: string): AnalysisResult {
   }
 }
 
+function buildCopilotSystemMessage(): string {
+  return `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
+
+When analyzing an article:
+1. Look for claims about dates, numbers, names, events, or scientific facts
+2. Use web search to verify suspicious claims against authoritative sources (Wikipedia, official websites, academic sources)
+3. Only report errors you have verified - do not guess or speculate
+4. Return your findings as structured JSON
+
+Be thorough but precise. Quality over quantity.`;
+}
+
 async function analyzeArticle(
   session: Awaited<ReturnType<CopilotClient["createSession"]>>,
   article: ArticleContent,
@@ -353,15 +365,7 @@ async function createWorkerPool(
 ): Promise<Worker[]> {
   const workers: Worker[] = [];
 
-  const systemMessage = `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
-
-When analyzing an article:
-1. Look for claims about dates, numbers, names, events, or scientific facts
-2. Use web search to verify suspicious claims against authoritative sources (Wikipedia, official websites, academic sources)
-3. Only report errors you have verified - do not guess or speculate
-4. Return your findings as structured JSON
-
-Be thorough but precise. Quality over quantity.`;
+  const systemMessage = buildCopilotSystemMessage();
 
   // Determine if we're using CDP browsers (need longer delays)
   const isCdpBrowser = ["comet", "chrome", "edge"].includes(browserManager.browserType);
@@ -408,15 +412,7 @@ async function refreshWorkerSession(
   worker: Worker,
   client: CopilotClient
 ): Promise<void> {
-  const systemMessage = `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
-
-When analyzing an article:
-1. Look for claims about dates, numbers, names, events, or scientific facts
-2. Use web search to verify suspicious claims against authoritative sources (Wikipedia, official websites, academic sources)
-3. Only report errors you have verified - do not guess or speculate
-4. Return your findings as structured JSON
-
-Be thorough but precise. Quality over quantity.`;
+  const systemMessage = buildCopilotSystemMessage();
 
   // Close old session (best effort)
   try {
@@ -431,6 +427,19 @@ Be thorough but precise. Quality over quantity.`;
   });
   
   worker.articlesProcessed = 0;
+}
+
+async function cleanupWorkers(workers: Worker[]): Promise<void> {
+  await Promise.all(
+    workers.map(async (worker) => {
+      try {
+        await worker.session.stop();
+      } catch {}
+      try {
+        (worker.copilotSession as any).close?.();
+      } catch {}
+    })
+  );
 }
 
 /**
@@ -539,6 +548,9 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   const topicBatchSize = 10;
   let topicCache: string[] = [];
   const usedTopics = new Set<string>();
+  let topicGenerationPromise: Promise<void> | null = null;
+  let topicGenerationErrorCount = 0;
+  const MAX_TOPIC_GENERATION_ERRORS = 3;
   
   // Get next article name (with memory management)
   const getNextArticle = async (workerId: number): Promise<string | null> => {
@@ -550,22 +562,46 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     
     // Generate topics on demand in small batches
     if (topicCache.length === 0 && progress.completed + progress.inProgress.size < options.iterations) {
-      const remaining = options.iterations - progress.completed - progress.inProgress.size;
-      const batchCount = Math.min(topicBatchSize, remaining);
-      
-      if (batchCount > 0) {
-        if (options.verbose) {
-          console.log(chalk.gray(`[W${workerId}] Generating ${batchCount} article topics...`));
-        }
-        const newTopics = await generateRandomArticleTopics(client, batchCount);
-        const freshTopics = newTopics.filter(t => !usedTopics.has(t));
-        topicCache.push(...freshTopics);
-        
-        // Limit topic cache size to prevent memory bloat
-        if (topicCache.length > TOPIC_CACHE_MAX_SIZE) {
-          topicCache = topicCache.slice(-TOPIC_CACHE_MAX_SIZE);
+      if (!topicGenerationPromise && topicGenerationErrorCount < MAX_TOPIC_GENERATION_ERRORS) {
+        const remaining = options.iterations - progress.completed - progress.inProgress.size;
+        const batchCount = Math.min(topicBatchSize, remaining);
+
+        if (batchCount > 0) {
+          if (options.verbose) {
+            console.log(chalk.gray(`[W${workerId}] Generating ${batchCount} article topics...`));
+          }
+
+          topicGenerationPromise = (async () => {
+            try {
+              const newTopics = await generateRandomArticleTopics(client, batchCount);
+              const freshTopics = newTopics.filter(t => !usedTopics.has(t));
+              topicCache.push(...freshTopics);
+
+              // Limit topic cache size to prevent memory bloat
+              if (topicCache.length > TOPIC_CACHE_MAX_SIZE) {
+                topicCache = topicCache.slice(-TOPIC_CACHE_MAX_SIZE);
+              }
+
+              topicGenerationErrorCount = 0;
+            } catch (error) {
+              topicGenerationErrorCount++;
+              if (options.verbose) {
+                console.log(chalk.yellow(`[W${workerId}] Topic generation failed: ${error}`));
+              }
+            } finally {
+              topicGenerationPromise = null;
+            }
+          })();
         }
       }
+    }
+
+    if (topicGenerationPromise) {
+      await topicGenerationPromise;
+    }
+
+    if (topicGenerationErrorCount >= MAX_TOPIC_GENERATION_ERRORS && topicCache.length === 0) {
+      return null;
     }
     
     // Periodically clear old entries from usedTopics to prevent unbounded growth
@@ -629,6 +665,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         progress.completed++;
         // Try to recover by getting a new session
         try {
+          await worker.session.stop();
           worker.session = await browserManager!.createSession();
           await refreshWorkerSession(worker, client);
         } catch (e) {
@@ -687,6 +724,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   console.log(chalk.bold(`Processed: ${progress.completed} articles with ${workers.length} parallel worker(s)`));
 
   spinner.start("Cleaning up...");
+  await cleanupWorkers(workers);
   await client.stop();
   await stopAllBrowsers();
   spinner.succeed("Done");
@@ -737,15 +775,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
       model: "claude-opus-4-5",
       streaming: true,
       systemMessage: {
-        content: `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
-
-When analyzing an article:
-1. Look for claims about dates, numbers, names, events, or scientific facts
-2. Use web search to verify suspicious claims against authoritative sources (Wikipedia, official websites, academic sources)
-3. Only report errors you have verified - do not guess or speculate
-4. Return your findings as structured JSON
-
-Be thorough but precise. Quality over quantity.`,
+        content: buildCopilotSystemMessage(),
       },
     });
     spinner.succeed("Session created");
@@ -887,6 +917,9 @@ Be thorough but precise. Quality over quantity.`,
   console.log(chalk.bold(`\nTotal: ${totalErrors} errors found, ${totalCorrections} corrections submitted`));
 
   spinner.start("Cleaning up...");
+  try {
+    (session as any).close?.();
+  } catch {}
   await client.stop();
   await stopAllBrowsers();
   spinner.succeed("Done");
