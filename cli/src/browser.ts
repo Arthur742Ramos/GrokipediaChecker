@@ -3,7 +3,7 @@
  * Handles browser lifecycle using playwright-cli for persistent sessions
  */
 
-import { PlaywrightCLISession, PlaywrightCLIManager, BrowserType as CLIBrowserType } from "./playwright-cli.js";
+import { PlaywrightCLISession, PlaywrightCLIManager, BrowserType as CLIBrowserType, closeAllSharedConnections } from "./playwright-cli.js";
 import * as fs from "fs";
 
 export type BrowserType = "chromium" | "firefox" | "webkit" | "comet" | "chrome" | "edge";
@@ -80,10 +80,11 @@ export async function stopBrowser(manager: BrowserManager): Promise<void> {
 }
 
 /**
- * Stop all browser sessions
+ * Stop all browser sessions and close shared connections
  */
 export async function stopAllBrowsers(): Promise<void> {
   await sessionManager.stopAll();
+  await closeAllSharedConnections();
 }
 
 /**

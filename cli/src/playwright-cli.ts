@@ -1216,31 +1216,49 @@ export class PlaywrightCLISession {
         // This handles the case where new pages don't automatically inherit all cookies
         await this.syncCookiesFromBrowser();
       } else {
-        // Use Playwright's bundled Chromium
-        const storageStatePath = path.join(this.sessionDir, "storage-state.json");
+        // Use Playwright's bundled Chromium with persistent context
+        // On Linux, use the VNC-authenticated profile if available
+        const linuxPersistentProfile = path.join(os.homedir(), ".config/chromium-persistent/chromium-vnc");
+        const usePersistentProfile = process.platform === "linux" && fs.existsSync(linuxPersistentProfile);
         
-        this.browser = await chromium.launch({
-          headless: !this.headed,
-        });
+        if (usePersistentProfile) {
+          console.log(`Using persistent Chromium profile at ${linuxPersistentProfile}`);
+          // Use launchPersistentContext to share cookies with the VNC session
+          this.context = await chromium.launchPersistentContext(linuxPersistentProfile, {
+            headless: !this.headed,
+            viewport: { width: 1280, height: 800 },
+            args: ["--no-sandbox", "--disable-gpu"],
+          });
+          // For persistent context, browser is accessed via context.browser()
+          this.browser = this.context.browser()!;
+          this.page = this.context.pages()[0] || await this.context.newPage();
+        } else {
+          // Fallback to regular launch with storage state
+          const storageStatePath = path.join(this.sessionDir, "storage-state.json");
+          
+          this.browser = await chromium.launch({
+            headless: !this.headed,
+          });
 
-        if (fs.existsSync(storageStatePath)) {
-          try {
-            this.context = await this.browser.newContext({
-              viewport: { width: 1280, height: 800 },
-              storageState: storageStatePath,
-            });
-          } catch {
+          if (fs.existsSync(storageStatePath)) {
+            try {
+              this.context = await this.browser.newContext({
+                viewport: { width: 1280, height: 800 },
+                storageState: storageStatePath,
+              });
+            } catch {
+              this.context = await this.browser.newContext({
+                viewport: { width: 1280, height: 800 },
+              });
+            }
+          } else {
             this.context = await this.browser.newContext({
               viewport: { width: 1280, height: 800 },
             });
           }
-        } else {
-          this.context = await this.browser.newContext({
-            viewport: { width: 1280, height: 800 },
-          });
-        }
 
-        this.page = await this.context.newPage();
+          this.page = await this.context.newPage();
+        }
       }
     }
 
@@ -1931,6 +1949,28 @@ export class PlaywrightCLIManager {
 
 // Default manager instance
 export const playwrightCLI = new PlaywrightCLIManager();
+
+/**
+ * Close all shared browser connections.
+ * Call this at the end of the process to ensure browsers are properly closed.
+ */
+export async function closeAllSharedConnections(): Promise<void> {
+  for (const [key, conn] of sharedBrowserConnections) {
+    try {
+      console.log(`Closing shared ${key} browser connection...`);
+      await conn.browser.close();
+    } catch {}
+  }
+  sharedBrowserConnections.clear();
+  
+  // Also kill any CDP processes we spawned
+  for (const [port, proc] of cdpProcesses) {
+    try {
+      proc.kill();
+    } catch {}
+  }
+  cdpProcesses.clear();
+}
 
 /**
  * Parse a snapshot output to extract element refs

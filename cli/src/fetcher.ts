@@ -248,6 +248,7 @@ export async function generateRandomArticleTopics(
   client: CopilotClient,
   count: number
 ): Promise<string[]> {
+  const allowInteractiveOutput = Boolean(process.stdout.isTTY && process.stderr.isTTY);
   const allTopics: string[] = [];
   const batchSize = 50;
   const batches = Math.ceil(count / batchSize);
@@ -326,8 +327,10 @@ Return ONLY a valid JSON array of strings, like: ["Topic 1", "Topic 2", ...]`;
         const topics = JSON.parse(jsonMatch[0]);
         if (Array.isArray(topics)) {
           const validTopics = topics.filter((t): t is string => typeof t === "string");
-          allTopics.push(...validTopics);
-          process.stdout.write(`\r  Generated ${allTopics.length}/${count} topics...`);
+           allTopics.push(...validTopics);
+           if (allowInteractiveOutput) {
+             process.stdout.write(`\r  Generated ${allTopics.length}/${count} topics...`);
+           }
         }
       }
     } catch (error) {
@@ -335,6 +338,8 @@ Return ONLY a valid JSON array of strings, like: ["Topic 1", "Topic 2", ...]`;
     }
   }
 
-  console.log(); // New line after progress
+  if (allowInteractiveOutput) {
+    console.log(); // New line after progress
+  }
   return [...new Set(allTopics)].slice(0, count); // Remove duplicates and limit to count
 }

@@ -21,6 +21,24 @@ import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
 import { CopilotClient, SessionEvent } from "@github/copilot-sdk";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+// Get the path to the Node.js copilot loader
+// The native binary doesn't support SDK's JSON-RPC protocol, but the Node loader does
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const COPILOT_LOADER_PATH = join(__dirname, "..", "node_modules", "@github", "copilot", "index.js");
+
+/**
+ * Create a CopilotClient configured to use the Node.js loader
+ * This is required because the native binary doesn't support the SDK protocol
+ */
+function createCopilotClient(): CopilotClient {
+  return new CopilotClient({
+    cliPath: "node",
+    cliArgs: [COPILOT_LOADER_PATH],
+  });
+}
 import { startBrowser, BrowserManager, BrowserType, getAvailableBrowsers, stopAllBrowsers } from "./browser.js";
 import { PlaywrightCLISession } from "./playwright-cli.js";
 import {
@@ -88,6 +106,28 @@ const TOPIC_CACHE_MAX_SIZE = 100; // Limit topic cache size
 // Global state for the review session
 let browserManager: BrowserManager | null = null;
 
+function setupBackgroundSafeIO(): void {
+  const handleStreamError = (stream: NodeJS.WriteStream) => {
+    stream.on("error", (error: NodeJS.ErrnoException) => {
+      if (error?.code === "EPIPE") {
+        return;
+      }
+      console.error(chalk.red(`Stream error: ${error?.message || error}`));
+    });
+  };
+
+  handleStreamError(process.stdout);
+  handleStreamError(process.stderr);
+
+  process.on("SIGPIPE", () => {
+    // Ignore SIGPIPE to avoid crashes when output is redirected
+  });
+}
+
+function canRenderInteractiveOutput(): boolean {
+  return Boolean(process.stdout.isTTY && process.stderr.isTTY);
+}
+
 /**
  * Parse the analysis response from Copilot to extract errors
  */
@@ -119,16 +159,18 @@ function parseAnalysisResponse(response: string): AnalysisResult {
   }
 }
 
+setupBackgroundSafeIO();
+
 function buildCopilotSystemMessage(): string {
   return `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
 
 When analyzing an article:
 1. Look for claims about dates, numbers, names, events, or scientific facts
-2. Use web search to verify suspicious claims against authoritative sources (Wikipedia, official websites, academic sources)
-3. Only report errors you have verified - do not guess or speculate
+2. Use web search to verify suspicious claims against authoritative PRIMARY sources (official government sites, academic journals, university websites, museum archives, official biographies, published books). Do NOT use Wikipedia as a source - it is not authoritative.
+3. Only report errors you have verified against primary sources - do not guess or speculate
 4. Return your findings as structured JSON
 
-Be thorough but precise. Quality over quantity.`;
+Be thorough but precise. Quality over quantity. Primary sources only.`;
 }
 
 async function analyzeArticle(
@@ -136,6 +178,7 @@ async function analyzeArticle(
   article: ArticleContent,
   verbose: boolean = false
 ): Promise<AnalysisResult> {
+  const allowInteractiveOutput = canRenderInteractiveOutput();
   const contentForAnalysis = article.content.substring(0, 15000);
 
   const prompt = `I have already fetched this Grokipedia article for you. Please analyze it for factual errors.
@@ -153,7 +196,7 @@ IMPORTANT: The article content is provided above. Do NOT try to fetch it again.
 Your task:
 1. Read through the article content above
 2. Identify claims that might be factually incorrect (dates, numbers, names, historical facts)
-3. Use web_fetch to verify suspicious claims against Wikipedia or other authoritative sources
+3. Use web_fetch to verify suspicious claims against PRIMARY sources (official sites, academic journals, university pages, museum archives, published biographies). Do NOT use Wikipedia - find primary sources instead.
 4. Report only verified errors
 
 Return your findings as JSON:
@@ -194,7 +237,7 @@ If no factual errors are found, return empty errors array. Focus on factual accu
       const delta = event.data.deltaContent;
       if (delta) {
         fullResponse += delta;
-        if (verbose) {
+        if (verbose && allowInteractiveOutput) {
           process.stdout.write(chalk.white(delta));
         }
       }
@@ -202,17 +245,19 @@ If no factual errors are found, return empty errors array. Focus on factual accu
     // Show progress dots for reasoning
     if (event.type === "assistant.reasoning_delta") {
       const reasoning = event.data?.deltaContent || "";
-      if (verbose) {
+      if (verbose && allowInteractiveOutput) {
         process.stdout.write(chalk.gray(reasoning));
       } else {
         dotCount++;
         if (dotCount % 10 === 0) {
-          process.stdout.write(chalk.gray("."));
+          if (allowInteractiveOutput) {
+            process.stdout.write(chalk.gray("."));
+          }
         }
       }
     }
     // Tool calls
-    if (eventAny.type === "tool.call" && verbose) {
+    if (eventAny.type === "tool.call" && verbose && allowInteractiveOutput) {
       const toolName = eventAny.data?.name || "unknown";
       const toolArgs = eventAny.data?.arguments || {};
       console.log(chalk.cyan(`\n[Tool: ${toolName}]`));
@@ -223,7 +268,7 @@ If no factual errors are found, return empty errors array. Focus on factual accu
       }
     }
     // Tool results
-    if (eventAny.type === "tool.result" && verbose) {
+    if (eventAny.type === "tool.result" && verbose && allowInteractiveOutput) {
       const result = eventAny.data?.content || "";
       const preview = typeof result === "string" ? result.substring(0, 300) : JSON.stringify(result).substring(0, 300);
       console.log(chalk.gray(`  Result: ${preview}${preview.length >= 300 ? "..." : ""}`));
@@ -242,7 +287,9 @@ If no factual errors are found, return empty errors array. Focus on factual accu
 
   try {
     await session.sendAndWait({ prompt }, 1800000); // 30 minute timeout
-    console.log("\n");
+    if (allowInteractiveOutput) {
+      console.log("\n");
+    }
   } catch (error) {
     console.error(chalk.red(`\nError during analysis: ${error}`));
   } finally {
@@ -436,7 +483,7 @@ async function cleanupWorkers(workers: Worker[]): Promise<void> {
         await worker.session.stop();
       } catch {}
       try {
-        (worker.copilotSession as any).close?.();
+        await (worker.copilotSession as any).close?.();
       } catch {}
     })
   );
@@ -460,6 +507,10 @@ function displayProgress(progress: WorkerProgress): void {
  */
 async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   const spinner = ora();
+  const allowInteractiveOutput = canRenderInteractiveOutput();
+  if (!allowInteractiveOutput) {
+    spinner.stop();
+  }
 
   console.log(chalk.bold.blue("\n=== Grokipedia Parallel Article Reviewer (playwright-cli) ===\n"));
   console.log(chalk.gray(`Iterations: ${options.iterations}`));
@@ -488,7 +539,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   spinner.start("Connecting to Copilot...");
   let client: CopilotClient;
   try {
-    client = new CopilotClient();
+    client = createCopilotClient();
     spinner.succeed("Connected to Copilot");
   } catch (error) {
     spinner.fail(`Failed to connect to Copilot: ${error}`);
@@ -567,9 +618,9 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         const batchCount = Math.min(topicBatchSize, remaining);
 
         if (batchCount > 0) {
-          if (options.verbose) {
-            console.log(chalk.gray(`[W${workerId}] Generating ${batchCount} article topics...`));
-          }
+        if (options.verbose && allowInteractiveOutput) {
+          console.log(chalk.gray(`[W${workerId}] Generating ${batchCount} article topics...`));
+        }
 
           topicGenerationPromise = (async () => {
             try {
@@ -585,7 +636,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
               topicGenerationErrorCount = 0;
             } catch (error) {
               topicGenerationErrorCount++;
-              if (options.verbose) {
+              if (options.verbose && allowInteractiveOutput) {
                 console.log(chalk.yellow(`[W${workerId}] Topic generation failed: ${error}`));
               }
             } finally {
@@ -675,7 +726,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
       }
       worker.busy = false;
 
-      if (!options.verbose) {
+      if (!options.verbose && allowInteractiveOutput) {
         displayProgress(progress);
       }
       
@@ -690,7 +741,9 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
 
   await Promise.all(runningTasks);
 
-  console.log("\n");
+  if (allowInteractiveOutput) {
+    console.log("\n");
+  }
 
   // Print summary - use running totals for large runs
   console.log(chalk.bold.green("\n=== Review Complete ===\n"));
@@ -732,6 +785,10 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
 
 async function runReviewLoop(options: ReviewOptions): Promise<void> {
   const spinner = ora();
+  const allowInteractiveOutput = canRenderInteractiveOutput();
+  if (!allowInteractiveOutput) {
+    spinner.stop();
+  }
 
   console.log(chalk.bold.blue("\n=== Grokipedia Article Reviewer (playwright-cli) ===\n"));
   console.log(chalk.gray(`Iterations: ${options.iterations}`));
@@ -759,7 +816,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
   spinner.start("Connecting to Copilot...");
   let client: CopilotClient;
   try {
-    client = new CopilotClient();
+    client = createCopilotClient();
     spinner.succeed("Connected to Copilot");
   } catch (error) {
     spinner.fail(`Failed to connect to Copilot: ${error}`);
