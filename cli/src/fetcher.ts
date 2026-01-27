@@ -260,7 +260,7 @@ export async function generateRandomArticleTopics(
     if (batchCount <= 0) break;
 
     const session = await client.createSession({
-      model: "claude-sonnet-4-20250514",
+      model: "gpt-5.2-medium",
       streaming: true,
       systemMessage: {
         content: `You are a helpful assistant that generates random encyclopedia article topics.

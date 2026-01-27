@@ -23,6 +23,21 @@ import ora from "ora";
 import { CopilotClient, SessionEvent } from "@github/copilot-sdk";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { appendFileSync } from "fs";
+
+// Global error handlers for resilience
+process.on("unhandledRejection", (reason, promise) => {
+  const msg = `[${new Date().toISOString()}] Unhandled Rejection: ${reason}\n`;
+  console.error(chalk.red(msg));
+  appendFileSync("/tmp/grokipedia-errors.log", msg);
+});
+
+process.on("uncaughtException", (error) => {
+  const msg = `[${new Date().toISOString()}] Uncaught Exception: ${error.message}\n${error.stack}\n`;
+  console.error(chalk.red(msg));
+  appendFileSync("/tmp/grokipedia-errors.log", msg);
+  // Don't exit - try to continue
+});
 
 // Get the path to the Node.js copilot loader
 // The native binary doesn't support SDK's JSON-RPC protocol, but the Node loader does
@@ -433,7 +448,7 @@ async function createWorkerPool(
     }
     
     const copilotSession = await client.createSession({
-      model: "claude-opus-4-5",
+      model: "gpt-5.2-medium",
       streaming: true,
       systemMessage: { content: systemMessage },
     });
@@ -468,7 +483,7 @@ async function refreshWorkerSession(
 
   // Create fresh session
   worker.copilotSession = await client.createSession({
-    model: "claude-opus-4-5",
+    model: "gpt-5.2-medium",
     streaming: true,
     systemMessage: { content: systemMessage },
   });
@@ -712,16 +727,28 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
           }
         }
       } catch (error) {
-        console.log(chalk.red(`[W${worker.id}] Fatal error: ${error}`));
+        const errorMsg = `[W${worker.id}] Fatal error: ${error}`;
+        console.log(chalk.red(errorMsg));
+        appendFileSync("/tmp/grokipedia-errors.log", `[${new Date().toISOString()}] ${errorMsg}\n`);
         progress.completed++;
         // Try to recover by getting a new session
         try {
-          await worker.session.stop();
+          await worker.session.stop().catch(() => {});
           worker.session = await browserManager!.createSession();
           await refreshWorkerSession(worker, client);
+          console.log(chalk.green(`[W${worker.id}] Recovered successfully`));
         } catch (e) {
-          console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
-          break;
+          console.log(chalk.yellow(`[W${worker.id}] Recovery failed, retrying in 5s...`));
+          await new Promise(r => setTimeout(r, 5000));
+          // One more attempt
+          try {
+            worker.session = await browserManager!.createSession();
+            await refreshWorkerSession(worker, client);
+            console.log(chalk.green(`[W${worker.id}] Recovered on retry`));
+          } catch (e2) {
+            console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
+            break;
+          }
         }
       }
       worker.busy = false;
@@ -829,7 +856,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
   let session;
   try {
     session = await client.createSession({
-      model: "claude-opus-4-5",
+      model: "gpt-5.2-medium",
       streaming: true,
       systemMessage: {
         content: buildCopilotSystemMessage(),
