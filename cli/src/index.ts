@@ -483,7 +483,7 @@ async function refreshWorkerSession(
 
   // Create fresh session
   worker.copilotSession = await client.createSession({
-    model: "gpt-5.2-medium",
+    model: "gpt-5.2-codex-medium",
     streaming: true,
     systemMessage: { content: systemMessage },
   });
