@@ -448,7 +448,7 @@ async function createWorkerPool(
     }
     
     const copilotSession = await client.createSession({
-      model: "gpt-5.2-medium",
+      model: "gpt-5.2-codex",
       streaming: true,
       systemMessage: { content: systemMessage },
     });
@@ -483,7 +483,7 @@ async function refreshWorkerSession(
 
   // Create fresh session
   worker.copilotSession = await client.createSession({
-    model: "gpt-5.2-codex-medium",
+    model: "gpt-5.2-codex",
     streaming: true,
     systemMessage: { content: systemMessage },
   });
