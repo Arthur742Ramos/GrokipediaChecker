@@ -116,6 +116,8 @@ interface WorkerProgress {
 
 // Constants for memory management
 const SESSION_REFRESH_INTERVAL = 50; // Recreate Copilot session every N articles to prevent memory buildup
+const PAGE_RESET_INTERVAL = 50; // Recreate browser session every N articles to limit memory growth
+const PAGE_REFRESH_INTERVAL = 20; // Recreate browser tab every N articles to prevent page-level leaks
 const TOPIC_CACHE_MAX_SIZE = 100; // Limit topic cache size
 
 // Global state for the review session
@@ -491,6 +493,14 @@ async function refreshWorkerSession(
   worker.articlesProcessed = 0;
 }
 
+async function maybeResetWorkerPage(worker: Worker): Promise<void> {
+  if (worker.articlesProcessed > 0 && worker.articlesProcessed % PAGE_REFRESH_INTERVAL === 0) {
+    try {
+      await worker.session.resetPage?.();
+    } catch {}
+  }
+}
+
 async function cleanupWorkers(workers: Worker[]): Promise<void> {
   await Promise.all(
     workers.map(async (worker) => {
@@ -704,6 +714,17 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
           console.log(chalk.yellow(`[W${worker.id}] Failed to refresh session, continuing with existing`));
         }
       }
+
+      // Recreate browser session periodically to prevent Playwright memory growth
+      if (worker.articlesProcessed > 0 && worker.articlesProcessed % PAGE_RESET_INTERVAL === 0) {
+        console.log(chalk.gray(`[W${worker.id}] Resetting browser session (processed ${worker.articlesProcessed} articles)...`));
+        try {
+          await worker.session.stop().catch(() => {});
+          worker.session = await browserManager!.createSession();
+        } catch (e) {
+          console.log(chalk.yellow(`[W${worker.id}] Failed to reset browser session, continuing with existing`));
+        }
+      }
       
       const articleName = await getNextArticle(worker.id);
       if (!articleName) {
@@ -752,6 +773,8 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         }
       }
       worker.busy = false;
+
+      await maybeResetWorkerPage(worker);
 
       if (!options.verbose && allowInteractiveOutput) {
         displayProgress(progress);

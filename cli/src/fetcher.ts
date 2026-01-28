@@ -320,6 +320,11 @@ Return ONLY a valid JSON array of strings, like: ["Topic 1", "Topic 2", ...]`;
     // Clean up the event handler to prevent accumulation
     unsubscribe();
 
+    // Close the Copilot session to avoid leaks
+    try {
+      (session as any).close?.();
+    } catch {}
+
     // Parse the JSON array from the response
     try {
       const jsonMatch = response.match(/\[[\s\S]*\]/);

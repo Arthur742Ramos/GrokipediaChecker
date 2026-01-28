@@ -865,6 +865,8 @@ export class PlaywrightCLISession {
   private cdpPort: number;
   private useCdp: boolean;
   private useSharedConnection: boolean = false; // Track if using shared connection
+  private lastCookieSyncAt: number = 0;
+  private readonly cookieSyncIntervalMs: number = 60000;
 
   constructor(sessionName: string, options: Omit<PlaywrightCLIOptions, "session"> = {}) {
     this.sessionName = sessionName;
@@ -1191,8 +1193,15 @@ export class PlaywrightCLISession {
         this.page = null;
       }
       
-      // For shared connections, don't close the browser
-      if (!this.useSharedConnection && this.browser) {
+      // For shared connections, release our reference before reconnecting
+      if (this.useSharedConnection) {
+        try {
+          await releaseSharedBrowserConnection(this.browserType);
+        } catch {}
+        this.useSharedConnection = false;
+        this.browser = null;
+        this.context = null;
+      } else if (this.browser) {
         try {
           await this.browser.close();
         } catch {}
@@ -1299,6 +1308,11 @@ export class PlaywrightCLISession {
       return;
     }
 
+    const now = Date.now();
+    if (now - this.lastCookieSyncAt < this.cookieSyncIntervalMs) {
+      return;
+    }
+
     let cdpSession: any = null;
     try {
       // Create a CDP session for this page
@@ -1378,7 +1392,8 @@ export class PlaywrightCLISession {
       } else {
         console.log("No Grokipedia session cookies found in browser - user may need to log in");
       }
-      
+
+      this.lastCookieSyncAt = now;
     } catch (err) {
       // Non-fatal - just log and continue
       console.log(`Note: Could not sync cookies via CDP: ${err}`);
@@ -1852,13 +1867,38 @@ export class PlaywrightCLISession {
     if (this.useSharedConnection) {
       // For shared connections, release the reference but don't close the browser
       await releaseSharedBrowserConnection(this.browserType);
-      // Don't null out browser/context since other sessions may be using them
+      // Clear references in this session to allow GC
+      this.browser = null;
+      this.context = null;
+      this.useSharedConnection = false;
     } else if (this.browser) {
       try {
         await this.browser.close();
       } catch {}
       this.browser = null;
       this.context = null;
+    }
+  }
+
+  /**
+   * Reset the current page to free page-level resources
+   */
+  async resetPage(): Promise<void> {
+    if (!this.context || !this.browser || !this.browser.isConnected()) {
+      await this.ensureBrowser();
+      return;
+    }
+
+    if (this.page) {
+      try {
+        await this.page.close();
+      } catch {}
+      this.page = null;
+    }
+
+    this.page = await this.context.newPage();
+    if (this.useCdp) {
+      await this.syncCookiesFromBrowser();
     }
   }
 
