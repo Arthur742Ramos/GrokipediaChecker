@@ -5,6 +5,75 @@
 
 import { PlaywrightCLISession, findRefByText, findRefsByPattern } from "./playwright-cli.js";
 
+/**
+ * Retry configuration for finding and clicking elements
+ */
+interface RetryConfig {
+  maxRetries: number;
+  delayMs: number;
+}
+
+const DEFAULT_CLICK_RETRY: RetryConfig = { maxRetries: 2, delayMs: 300 };
+const SUGGEST_EDIT_RETRY: RetryConfig = { maxRetries: 3, delayMs: 500 };
+
+/**
+ * Helper to find an element with retries and fresh snapshots
+ */
+async function findElementWithRetry(
+  session: PlaywrightCLISession,
+  findFn: (snapshot: string) => string | null,
+  config: RetryConfig = DEFAULT_CLICK_RETRY
+): Promise<{ ref: string; snapshot: string } | null> {
+  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
+    const snapshot = await session.snapshot();
+    const ref = findFn(snapshot);
+    if (ref) {
+      return { ref, snapshot };
+    }
+    if (attempt < config.maxRetries) {
+      await session.wait(config.delayMs);
+    }
+  }
+  return null;
+}
+
+/**
+ * Click an element with retry logic - gets fresh snapshot on failure
+ */
+async function clickWithRetry(
+  session: PlaywrightCLISession,
+  findFn: (snapshot: string) => string | null,
+  config: RetryConfig = DEFAULT_CLICK_RETRY
+): Promise<boolean> {
+  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
+    const snapshot = await session.snapshot();
+    const ref = findFn(snapshot);
+    if (!ref) {
+      if (attempt < config.maxRetries) {
+        await session.wait(config.delayMs);
+        continue;
+      }
+      return false;
+    }
+    
+    try {
+      await session.click(ref);
+      return true;
+    } catch (error) {
+      const errorMsg = String(error);
+      // Retry on "Element not found" or stale element errors
+      if (errorMsg.includes("not found") || errorMsg.includes("stale")) {
+        if (attempt < config.maxRetries) {
+          await session.wait(config.delayMs);
+          continue;
+        }
+      }
+      throw error;
+    }
+  }
+  return false;
+}
+
 export interface EditResult {
   success: boolean;
   article: string;
@@ -283,21 +352,20 @@ export async function submitEdit(
 
     // Trigger selection event
     await session.eval(`document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }))`);
-    await session.wait(500);
+    // Wait longer for popup menu to appear (1000ms instead of 500ms)
+    await session.wait(1000);
 
-    // Get new snapshot and find Suggest Edit button
-    snapshot = await session.snapshot();
-    
-    // Look for Suggest Edit button
-    const suggestEditRef = findRefByText(snapshot, "Suggest Edit", { partial: true }) ||
-                           findRefByText(snapshot, "suggest edit", { partial: true });
+    // Find Suggest Edit button with retries (popup may take time to appear)
+    const findSuggestEdit = (snap: string): string | null => {
+      return findRefByText(snap, "Suggest Edit", { partial: true }) ||
+             findRefByText(snap, "suggest edit", { partial: true });
+    };
 
-    if (!suggestEditRef) {
+    const suggestEditClicked = await clickWithRetry(session, findSuggestEdit, SUGGEST_EDIT_RETRY);
+    if (!suggestEditClicked) {
       result.message = "Could not find Suggest Edit button";
       return result;
     }
-
-    await session.click(suggestEditRef);
     await session.wait(1000);
 
     // Get new snapshot to find form elements
@@ -316,14 +384,13 @@ export async function submitEdit(
 
     // Fill in correction if provided
     if (correction && textareaRefs.length > 1) {
-      // Try to expand content editing if needed
+      // Try to expand content editing if needed - use retry logic
+      const findEditContent = (snap: string): string | null => {
+        return findRefByText(snap, "Edit content", { partial: true });
+      };
+      await clickWithRetry(session, findEditContent);
+      await session.wait(500);
       snapshot = await session.snapshot();
-      const editContentRef = findRefByText(snapshot, "Edit content", { partial: true });
-      if (editContentRef) {
-        await session.click(editContentRef);
-        await session.wait(500);
-        snapshot = await session.snapshot();
-      }
 
       const allTextareas = findRefsByPattern(snapshot, /textbox|textarea/i);
       if (allTextareas.length > 1) {
@@ -335,12 +402,12 @@ export async function submitEdit(
     if (sources && sources.length > 0) {
       for (let i = 0; i < sources.length; i++) {
         if (i > 0) {
-          snapshot = await session.snapshot();
-          const addAnotherRef = findRefByText(snapshot, "Add another", { partial: true });
-          if (addAnotherRef) {
-            await session.click(addAnotherRef);
-            await session.wait(300);
-          }
+          // Use retry logic for "Add another" button
+          const findAddAnother = (snap: string): string | null => {
+            return findRefByText(snap, "Add another", { partial: true });
+          };
+          await clickWithRetry(session, findAddAnother);
+          await session.wait(300);
         }
         
         snapshot = await session.snapshot();
@@ -354,13 +421,14 @@ export async function submitEdit(
       }
     }
 
-    // Find and click Submit button
-    snapshot = await session.snapshot();
-    const submitRef = findRefByText(snapshot, "Submit Edit", { partial: true }) ||
-                      findRefByText(snapshot, "Submit", { partial: true });
+    // Find and click Submit button with retry logic
+    const findSubmit = (snap: string): string | null => {
+      return findRefByText(snap, "Submit Edit", { partial: true }) ||
+             findRefByText(snap, "Submit", { partial: true });
+    };
 
-    if (submitRef) {
-      await session.click(submitRef);
+    const submitClicked = await clickWithRetry(session, findSubmit);
+    if (submitClicked) {
       await session.wait(2000);
       result.success = true;
       result.message = "Edit submitted successfully";
