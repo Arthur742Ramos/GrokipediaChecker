@@ -1121,10 +1121,10 @@ program
       process.exit(1);
     }
 
-    // Cap parallel workers at 10
-    if (options.parallel > 10) {
-      console.log(chalk.yellow(`Warning: Capping parallel workers at 10 (requested ${options.parallel})`));
-      options.parallel = 10;
+    // Cap parallel workers at 30
+    if (options.parallel > 30) {
+      console.log(chalk.yellow(`Warning: Capping parallel workers at 30 (requested ${options.parallel})`));
+      options.parallel = 30;
     }
 
     // Use parallel loop if more than 1 worker

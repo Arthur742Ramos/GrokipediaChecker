@@ -1,189 +1,212 @@
 # Grokipedia Fact-Checker & Content Improver
 
-This project provides tools for automated fact-checking, content improvement, and editing of Grokipedia articles.
+> **Purpose**: Automated fact-checking and editing of Grokipedia wiki articles using AI analysis and browser automation.
+>
+> **Tech Stack**: TypeScript CLI with GitHub Copilot SDK (Claude Opus 4.5), Playwright browser automation, CDP for session persistence.
+>
+> **Target**: [Grokipedia](https://grokipedia.com) - a wiki-style knowledge base with AI-generated articles that frequently contain subtle factual errors.
 
-## Overview
+---
 
-Grokipedia is a wiki-style knowledge base. This project helps identify factual errors, inconsistencies, awkward phrasing, and areas for improvement in articles, then submits corrections through the browser UI.
+## Why This Project Exists
 
-## When to Use Each Skill
+Grokipedia articles are **AI-generated** and often contain plausible-sounding but incorrect facts. The errors are subtle—wrong death years, incorrect game scores, misattributed quotes—making them hard to catch by casual reading. This tool automates the tedious verification work by:
 
-| Skill | When to Call |
-|-------|-------------|
-| `grokipedia-fetch-content` | First step - always call this to get article text before any analysis |
-| `grokipedia-fact-check` | Reference these guidelines while analyzing fetched content |
-| `grokipedia-submit-edit` | After finding and verifying an issue, call this to submit the correction |
+1. Fetching article content via browser automation (preserving login state)
+2. Using Claude Opus 4.5 to identify verifiable claims
+3. Cross-referencing with web search and Wikipedia
+4. Submitting corrections directly through Grokipedia's edit UI
 
-## Complete Workflow
+**Design decision**: We use browser automation rather than an API because Grokipedia has no public API. The CDP (Chrome DevTools Protocol) approach lets us reuse an existing logged-in browser session.
 
-### Step 1: Fetch Article Content
+---
+
+## Architecture at a Glance
+
+```
+┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  TypeScript CLI     │────▶│  Playwright/CDP  │────▶│   Grokipedia    │
+│  (Copilot SDK)      │     │  Browser Manager │     │   (Target Site) │
+└─────────────────────┘     └──────────────────┘     └─────────────────┘
+         │
+         ▼
+┌─────────────────────┐
+│  web_search Tool    │  ← Copilot's built-in fact verification
+└─────────────────────┘
+```
+
+**Key insight**: The CLI orchestrates Copilot sessions that have access to `web_search` for verification. The AI does the fact-checking reasoning; we just handle browser I/O.
+
+---
+
+## Skill Reference
+
+| Skill | Purpose | When to Use |
+|-------|---------|-------------|
+| `grokipedia-fetch-content` | Get article text via browser automation | **Always first** - before any analysis |
+| `grokipedia-fact-check` | Guidelines for what to verify | Reference during analysis |
+| `grokipedia-submit-edit` | Submit corrections via browser | After verifying an error |
+
+---
+
+## Common Pitfalls & Gotchas
+
+### ⚠️ Text Selection Failures
+The submit script uses **exact text matching** to find and select content in the browser. Special characters cause failures:
+- **Em dashes (—)** vs hyphens (-)
+- **Curly quotes ("")** vs straight quotes ("")
+- **Non-breaking spaces** vs regular spaces
+
+**Fix**: Copy text exactly from the fetched content, including special characters.
+
+### ⚠️ "Not Signed In" Errors
+CDP connects to an existing browser profile. If you see auth errors:
+1. Open Comet browser manually
+2. Navigate to Grokipedia and log in
+3. Leave browser running, then retry
+
+**Why**: The automation reuses your existing session cookies. It cannot log in for you.
+
+### ⚠️ CDP Port Conflicts
+If `port 9222` is busy:
+```bash
+lsof -ti:9222 | xargs kill -9
+```
+**Why**: Only one process can connect to CDP on a given port. Old browser instances may hold it.
+
+### ⚠️ Memory Leaks in Long Runs
+For batch processing (100+ articles), sessions are automatically refreshed:
+- Copilot sessions: every 50 articles
+- Browser sessions: every 50 articles
+- Browser pages: every 20 articles
+
+**Why**: Playwright pages accumulate memory over time. The CLI handles this automatically.
+
+### ⚠️ Sports Articles Have Highest Error Rate
+~8-10% error rate in sports articles. Common issues:
+- Wrong pitcher credited for wins/losses
+- "Complete game" claims that are actually 8+ innings with a reliever
+- Confused team matchups (which teams played which Super Bowl)
+- Wrong hit/RBI/medal counts
+
+**Why**: Sports stats are precise and easily verifiable, but AI often hallucinates specific numbers.
+
+---
+
+## Error Types Found in Production
+
+| Category | Examples | Frequency | Verification Strategy |
+|----------|----------|-----------|----------------------|
+| **Wrong Numbers** | Scores, medal counts, distances | High | Cross-check with Wikipedia/ESPN |
+| **Wrong Names** | Misattributed plays, wrong broadcasters | Medium | Search for specific event details |
+| **Wrong Dates** | Death years off by 1, wrong centuries | Medium | Wikipedia infoboxes |
+| **Complete Game Claims** | Pitcher credited with CG but used reliever | Medium | Check box scores |
+| **Chronological Errors** | Historical figures in wrong time periods | Medium | Verify birth/death dates first |
+| **Superlative Errors** | "First," "only," "largest" claims | Low | These are often wrong |
+
+---
+
+## Workflow: Analyzing an Article
+
+### Step 1: Fetch Content
 ```bash
 python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article Name"
 ```
-This returns JSON with:
-- `article`: Article name
-- `url`: Full URL
-- `signed_in`: Whether user is authenticated
-- `content`: Full article text
-- `sections`: Parsed section structure
 
-### Step 2: AI Analysis (You Do This)
+Returns JSON with `content`, `sections`, `signed_in` status, and `url`.
 
-Read the content carefully and identify issues in two categories:
+### Step 2: Identify Verifiable Claims
 
-#### A. Factual Issues
-- **Internal inconsistencies**: Same fact stated with different values (e.g., "3.5 km" vs "2.7 km")
-- **Factual errors**: Wrong dates, names, numbers, death years, measurements
-- **Logical contradictions**: Statements that conflict with each other
-- **Outdated info**: Facts that have changed since article was written
+**Do NOT just skim**. Proactively verify:
+- Birth/death dates of people mentioned
+- Event dates (battles, discoveries, inventions)
+- Numerical claims (distances, populations, scores)
+- Attribution claims (who discovered/invented/said what)
 
-#### B. Writing Quality Issues
-- **Awkward phrasing**: Sentences that read poorly or are hard to understand
-- **Clarity problems**: Text that could be explained more simply
-- **Redundancy**: Unnecessary repetition of information
-- **Grammar errors**: Incorrect grammar, punctuation, or spelling
-- **Jargon without context**: Technical terms not explained for general readers
-- **Run-on sentences**: Long sentences that should be split
+### Step 3: Verify with Web Search
 
-### Step 3: PROACTIVE Fact-Checking with Web Search (CRITICAL)
-
-**Do NOT just skim for obvious errors.** Actively verify key claims in every article:
-
-#### What to Verify
-- **Birth/death dates** of people mentioned
-- **Event dates** (battles, discoveries, inventions)
-- **Numerical claims** (distances, populations, measurements)
-- **Names and titles** (people, places, organizations)
-- **Scientific facts** (formulas, discoveries, attributions)
-- **Historical claims** (who did what, when, where)
-
-#### How to Verify
-Use `web_search` for quick verification:
 ```
-web_search("Albert Einstein birth date March 14 1879")
-web_search("Great Wall of China length kilometers")
-web_search("Battle of Actium date 31 BC")
+web_search("Phineas Gage death date 1860")
+web_search("Super Bowl VII final score Dolphins Redskins")
 ```
 
-Or fetch Wikipedia directly for comprehensive cross-checking:
+Or fetch Wikipedia directly:
 ```
-web_fetch url="https://en.wikipedia.org/wiki/Article_Name"
+web_fetch url="https://en.wikipedia.org/wiki/Phineas_Gage"
 ```
 
-#### Verification Strategy
-1. **Pick 3-5 key facts** from each article to verify
-2. **Focus on specifics**: dates, numbers, names are most error-prone
-3. **Cross-reference** with Wikipedia or authoritative sources
-4. **Look for discrepancies** between article and verified sources
-
-**IMPORTANT**: Don't assume well-written articles are factually correct. Always verify before moving to the next article.
+**Key insight**: Pick 3-5 specific, verifiable facts per article. Focus on dates and numbers—these are most error-prone.
 
 ### Step 4: Submit Corrections
 
-For each confirmed issue:
 ```bash
-python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
-  --article "Article Name" \
-  --text "exact text to correct" \
-  --summary "Clear explanation of why this needs correction" \
-  --correction "The fixed text" \
-  --sources "https://source-url.com"
-```
-
-Parameters:
-- `--article`: Article title (required)
-- `--text`: The exact text from the article to select (required)
-- `--summary`: Explanation for the edit (required)
-- `--correction`: The corrected version of the text (optional, for content changes)
-- `--sources`: URL(s) supporting the correction (optional but recommended)
-
-## Example Session
-
-```bash
-# 1. Fetch the article
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Phineas Gage"
-
-# 2. AI reads content, notices "Phineas Gage (1823–1861)"
-
-# 3. Verify with web search - finds he died in 1860, not 1861
-
-# 4. Submit correction
 python3 .github/skills/grokipedia-submit-edit/submit_edit.py \
   --article "Phineas Gage" \
   --text "Phineas Gage (1823–1861)" \
-  --summary "Incorrect death year: Gage died May 21, 1860, not 1861" \
+  --summary "Death year incorrect: Gage died May 21, 1860" \
   --correction "Phineas Gage (1823–1860)" \
   --sources "https://en.wikipedia.org/wiki/Phineas_Gage"
 ```
 
-## Batch Processing Multiple Articles
-
-Process articles **sequentially** for reliability:
-
-### Sequential Workflow
-
-```bash
-# Process one article at a time
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article 1"
-# Analyze, verify, submit corrections...
-
-python3 .github/skills/grokipedia-fetch-content/fetch_content.py "Article 2"
-# Analyze, verify, submit corrections...
-```
-
-### Recommended Sequential Workflow
-
-1. **Fetch article** - get content for one article
-2. **AI analysis** - analyze for factual errors AND writing quality issues
-3. **Verify claims** - use web_search to verify suspicious facts
-4. **Submit corrections** - submit all corrections for that article
-5. **Move to next article** - repeat for next article
-6. **Report summary** periodically (every 10-20 articles)
-
-### What to Check in Each Article
-
-#### Proactive Fact-Checking (REQUIRED)
-For EVERY article, verify at least 3-5 key facts using web_search:
-- Birth/death dates of main subjects
-- Key event dates and locations
-- Numerical claims (distances, populations, measurements)
-- Attribution of discoveries, inventions, quotes
-
-#### Factual Issues to Look For
-- Incorrect dates, names, numbers
-- Internal inconsistencies
-- Outdated information
-
-#### Writing Quality Issues (IMPORTANT)
-- **Awkward phrasing** - sentences that read poorly
-- **Clarity problems** - text that could be simpler
-- **Redundancy** - unnecessary repetition
-- **Grammar errors** - incorrect grammar, punctuation, spelling
-- **Run-on sentences** - long sentences that should be split
-- **Jargon without context** - technical terms not explained
+---
 
 ## What NOT to Correct
 
-- Minor stylistic preferences (unless genuinely awkward)
-- Regional spelling differences (color vs colour)
-- Disputed facts where multiple valid interpretations exist
-- Claims you cannot verify with reliable sources
-- Correct information that just seems unusual
+- **Stylistic preferences** (unless genuinely awkward)
+- **Regional spelling** (color vs colour)
+- **Disputed facts** where multiple interpretations exist
+- **Unverifiable claims** - if you can't find a source, skip it
+- **Unusual but correct facts** - verify before assuming error
+
+---
+
+## TypeScript CLI Usage (Recommended)
+
+The TypeScript CLI in `cli/` is the primary interface:
+
+```bash
+cd cli
+npm install && npm run build
+
+# Single article, dry run (no submissions)
+node dist/index.js -a "Bermuda Triangle" --dry-run
+
+# 10 articles with 3 parallel workers
+node dist/index.js -n 10 -p 3 --dry-run
+
+# Theme-based with Comet browser
+node dist/index.js -n 5 -t "super bowl" -b comet
+
+# Verbose mode (see AI reasoning)
+node dist/index.js -n 2 -v --dry-run
+```
+
+**Why parallel workers?** Each worker gets its own browser page and Copilot session, enabling 3-5x throughput for batch processing.
+
+---
 
 ## Technical Details
 
-### Browser Automation
-- Uses Comet browser with Chrome DevTools Protocol (CDP)
-- Port 9222 for CDP connection
-- Runs in headless mode (no window focus stealing)
-- Preserves authentication via existing Comet profile
+### Browser Support
+| Browser | Path | Login Persistence |
+|---------|------|-------------------|
+| Comet | `/Applications/Comet.app` | ✅ Reuses existing session |
+| Chrome | `/Applications/Google Chrome.app` | ✅ Reuses existing session |
+| Chromium | Playwright-bundled | ❌ Fresh session each run |
+
+**Design decision**: We default to CDP-connected browsers (Comet/Chrome) because Grokipedia requires authentication, and we want to reuse the user's existing login rather than handle credentials.
+
+### Session Refresh Strategy
+```typescript
+const SESSION_REFRESH_INTERVAL = 50;  // Recreate Copilot session
+const PAGE_RESET_INTERVAL = 50;       // Recreate browser session
+const PAGE_REFRESH_INTERVAL = 20;     // Recreate browser tab
+```
+
+**Why**: Long-running Copilot sessions accumulate context. Periodic refresh prevents OOM errors and keeps response quality high.
 
 ### Requirements
-- macOS with Comet browser at `/Applications/Comet.app`
-- User logged into Grokipedia in Comet
-- Python 3 with Playwright (`pip install playwright`)
-
-### Troubleshooting
-- If "not signed in", open Comet manually and log into Grokipedia first
-- If CDP port busy, kill existing process: `lsof -ti:9222 | xargs kill -9`
-- If browser opens visible window, check headless flag in scripts
+- macOS (browser paths are macOS-specific)
+- Node.js 18+
+- User logged into Grokipedia in Comet/Chrome
+- Python 3.8+ with Playwright (for legacy scripts)
