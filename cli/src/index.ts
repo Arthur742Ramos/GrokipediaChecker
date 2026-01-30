@@ -450,7 +450,7 @@ async function createWorkerPool(
     }
     
     const copilotSession = await client.createSession({
-      model: "gpt-5.2-codex",
+      model: "claude-sonnet-4.5",
       streaming: true,
       systemMessage: { content: systemMessage },
     });
@@ -485,7 +485,7 @@ async function refreshWorkerSession(
 
   // Create fresh session
   worker.copilotSession = await client.createSession({
-    model: "gpt-5.2-codex",
+    model: "claude-sonnet-4.5",
     streaming: true,
     systemMessage: { content: systemMessage },
   });
@@ -879,7 +879,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
   let session;
   try {
     session = await client.createSession({
-      model: "gpt-5.2-medium",
+      model: "claude-sonnet-4.5",
       streaming: true,
       systemMessage: {
         content: buildCopilotSystemMessage(),
