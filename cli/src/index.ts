@@ -69,6 +69,7 @@ import { submitEdit, EditRequest } from "./submitter.js";
 interface ReviewOptions {
   iterations: number;
   parallel: number;
+  batchSize: number;
   article?: string;
   themes?: string[];
   headless: boolean;
@@ -88,6 +89,10 @@ interface FactError {
 interface AnalysisResult {
   errors: FactError[];
   summary: string;
+}
+
+interface BatchAnalysisResult {
+  results: { [articleName: string]: AnalysisResult };
 }
 
 // Worker types for parallel processing
@@ -174,6 +179,244 @@ function parseAnalysisResponse(response: string): AnalysisResult {
     // No JSON found, return empty
     return { errors: [], summary: response };
   }
+}
+
+/**
+ * Parse batch analysis response from Copilot
+ * Expects JSON with results keyed by article name
+ */
+function parseBatchAnalysisResponse(response: string, articleNames: string[]): BatchAnalysisResult {
+  const defaultResult: BatchAnalysisResult = {
+    results: {},
+  };
+  
+  // Initialize with empty results for all articles
+  for (const name of articleNames) {
+    defaultResult.results[name] = { errors: [], summary: "" };
+  }
+
+  // Try to find JSON in the response
+  const jsonMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      if (parsed.results && typeof parsed.results === "object") {
+        for (const name of articleNames) {
+          const result = parsed.results[name];
+          if (result) {
+            defaultResult.results[name] = {
+              errors: result.errors || [],
+              summary: result.summary || "",
+            };
+          }
+        }
+        return defaultResult;
+      }
+    } catch (e) {
+      console.log(chalk.yellow("Could not parse batch JSON from response"));
+    }
+  }
+
+  // Try to parse the entire response as JSON
+  try {
+    const parsed = JSON.parse(response);
+    if (parsed.results && typeof parsed.results === "object") {
+      for (const name of articleNames) {
+        const result = parsed.results[name];
+        if (result) {
+          defaultResult.results[name] = {
+            errors: result.errors || [],
+            summary: result.summary || "",
+          };
+        }
+      }
+      return defaultResult;
+    }
+  } catch (e) {
+    // No JSON found
+  }
+
+  return defaultResult;
+}
+
+/**
+ * Fetch multiple articles in parallel
+ */
+async function batchFetchArticles(
+  session: PlaywrightCLISession,
+  articleNames: string[],
+  headed: boolean = false,
+  verbose: boolean = false
+): Promise<ArticleContent[]> {
+  const results: ArticleContent[] = [];
+  
+  // Fetch articles in parallel with a small concurrency limit to avoid overwhelming the browser
+  const FETCH_CONCURRENCY = 3;
+  
+  for (let i = 0; i < articleNames.length; i += FETCH_CONCURRENCY) {
+    const batch = articleNames.slice(i, i + FETCH_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(async (articleName) => {
+        try {
+          return await fetchArticleContent(session, articleName, headed);
+        } catch (error) {
+          return {
+            article: articleName,
+            url: `https://grokipedia.com/page/${articleName.replace(/ /g, "_")}`,
+            signedIn: false,
+            content: "",
+            sections: [],
+            error: String(error),
+          };
+        }
+      })
+    );
+    results.push(...batchResults);
+    
+    // Small delay between fetch batches
+    if (i + FETCH_CONCURRENCY < articleNames.length) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  
+  return results;
+}
+
+/**
+ * Analyze multiple articles in a single Copilot call
+ */
+async function analyzeBatchArticles(
+  session: Awaited<ReturnType<CopilotClient["createSession"]>>,
+  articles: ArticleContent[],
+  verbose: boolean = false
+): Promise<BatchAnalysisResult> {
+  const allowInteractiveOutput = canRenderInteractiveOutput();
+  const articleNames = articles.map(a => a.article);
+  
+  // Build the batch prompt
+  let articlesContent = "";
+  for (let i = 0; i < articles.length; i++) {
+    const article = articles[i];
+    const contentForAnalysis = article.content.substring(0, 8000); // Smaller per-article limit for batches
+    articlesContent += `
+=== ARTICLE ${i + 1}: "${article.article}" ===
+URL: ${article.url}
+CONTENT:
+${contentForAnalysis}
+
+`;
+  }
+
+  const prompt = `I have fetched ${articles.length} Grokipedia articles for you. Please analyze ALL of them for factual errors.
+
+${articlesContent}
+---
+
+IMPORTANT: All article content is provided above. Do NOT try to fetch them again.
+
+Your task for EACH article:
+1. Read through the article content
+2. Identify claims that might be factually incorrect (dates, numbers, names, historical facts)
+3. Use web_fetch to verify suspicious claims against PRIMARY sources (official sites, academic journals, university pages, museum archives, published biographies). Do NOT use Wikipedia - find primary sources instead.
+4. Report only verified errors
+
+Return your findings as JSON with results for ALL articles:
+\`\`\`json
+{
+  "results": {
+    "${articleNames[0]}": {
+      "errors": [
+        {
+          "text_to_select": "exact text from article containing the error (copy verbatim)",
+          "error_description": "what is wrong with this text",
+          "correct_information": "the verified correct fact",
+          "corrected_text": "the replacement text that should replace text_to_select",
+          "sources": ["url used to verify"]
+        }
+      ],
+      "summary": "brief analysis summary"
+    },
+    "${articleNames.length > 1 ? articleNames[1] : "Article Name 2"}": {
+      "errors": [...],
+      "summary": "..."
+    }${articleNames.length > 2 ? ",\n    // ... continue for all articles" : ""}
+  }
+}
+\`\`\`
+
+CRITICAL: 
+- Include results for ALL ${articles.length} articles, even if no errors found (use empty errors array)
+- "text_to_select" must be the EXACT text from the article that contains the error
+- "corrected_text" must be DIFFERENT from text_to_select
+- Focus on factual accuracy, not style`;
+
+  let fullResponse = "";
+  let dotCount = 0;
+
+  const eventHandler = (event: SessionEvent) => {
+    const eventAny = event as any;
+    
+    if (event.type === "assistant.message_delta") {
+      const delta = event.data.deltaContent;
+      if (delta) {
+        fullResponse += delta;
+        if (verbose && allowInteractiveOutput) {
+          process.stdout.write(chalk.white(delta));
+        }
+      }
+    }
+    if (event.type === "assistant.reasoning_delta") {
+      const reasoning = event.data?.deltaContent || "";
+      if (verbose && allowInteractiveOutput) {
+        process.stdout.write(chalk.gray(reasoning));
+      } else {
+        dotCount++;
+        if (dotCount % 10 === 0) {
+          if (allowInteractiveOutput) {
+            process.stdout.write(chalk.gray("."));
+          }
+        }
+      }
+    }
+    if (eventAny.type === "tool.call" && verbose && allowInteractiveOutput) {
+      const toolName = eventAny.data?.name || "unknown";
+      const toolArgs = eventAny.data?.arguments || {};
+      console.log(chalk.cyan(`\n[Tool: ${toolName}]`));
+      if (toolName === "web_fetch" && toolArgs.url) {
+        console.log(chalk.gray(`  Fetching: ${toolArgs.url}`));
+      } else {
+        console.log(chalk.gray(`  Args: ${JSON.stringify(toolArgs).substring(0, 200)}`));
+      }
+    }
+    if (eventAny.type === "tool.result" && verbose && allowInteractiveOutput) {
+      const result = eventAny.data?.content || "";
+      const preview = typeof result === "string" ? result.substring(0, 300) : JSON.stringify(result).substring(0, 300);
+      console.log(chalk.gray(`  Result: ${preview}${preview.length >= 300 ? "..." : ""}`));
+    }
+    if (event.type === "assistant.message") {
+      const content = event.data?.content;
+      if (content && !fullResponse) {
+        fullResponse = content;
+      }
+    }
+  };
+
+  const unsubscribe = session.on(eventHandler);
+
+  try {
+    // Longer timeout for batch analysis (30 min base + 5 min per additional article)
+    const timeoutMs = 1800000 + (articles.length - 1) * 300000;
+    await session.sendAndWait({ prompt }, timeoutMs);
+    if (allowInteractiveOutput) {
+      console.log("\n");
+    }
+  } catch (error) {
+    console.error(chalk.red(`\nError during batch analysis: ${error}`));
+  } finally {
+    unsubscribe();
+  }
+
+  return parseBatchAnalysisResponse(fullResponse, articleNames);
 }
 
 setupBackgroundSafeIO();
@@ -420,6 +663,142 @@ async function processArticle(
 }
 
 /**
+ * Process a batch of articles with a worker
+ * Fetches all articles, analyzes them in a single Copilot call, then submits corrections
+ */
+async function processBatch(
+  worker: Worker,
+  articleNames: string[],
+  options: ReviewOptions,
+  progress: WorkerProgress
+): Promise<ArticleResult[]> {
+  const results: ArticleResult[] = [];
+  const prefix = chalk.cyan(`[W${worker.id}]`);
+  
+  // Initialize results for each article
+  for (const name of articleNames) {
+    results.push({
+      article: name,
+      errorsFound: 0,
+      correctionsSubmitted: 0,
+      workerId: worker.id,
+    });
+  }
+
+  // Track batch in progress
+  const batchLabel = articleNames.length > 1 
+    ? `${articleNames[0]} +${articleNames.length - 1}` 
+    : articleNames[0];
+  progress.inProgress.set(worker.id, batchLabel);
+  
+  try {
+    // Fetch all articles in parallel
+    if (options.verbose) {
+      console.log(`${prefix} Fetching batch: ${articleNames.join(", ")}`);
+    }
+    const articles = await batchFetchArticles(worker.session, articleNames, !options.headless, options.verbose);
+    
+    // Filter out failed fetches but keep track for reporting
+    const successfulArticles: ArticleContent[] = [];
+    const articleMap = new Map<string, ArticleContent>();
+    
+    for (let i = 0; i < articles.length; i++) {
+      const article = articles[i];
+      articleMap.set(article.article, article);
+      
+      if (article.error) {
+        console.log(chalk.red(`${prefix} Failed to fetch ${article.article}: ${article.error}`));
+      } else {
+        successfulArticles.push(article);
+        if (options.verbose) {
+          console.log(`${prefix} Fetched ${article.article}: ${article.content.length} chars`);
+        }
+      }
+    }
+    
+    // Check login status once
+    const firstSuccess = successfulArticles[0];
+    if (firstSuccess && !firstSuccess.signedIn && !options.dryRun) {
+      console.log(chalk.yellow(`${prefix} Warning: Not signed in to Grokipedia`));
+      console.log(chalk.dim(`${prefix}   The browser session may not have your login cookies.`));
+    }
+    
+    if (successfulArticles.length === 0) {
+      console.log(chalk.red(`${prefix} All articles in batch failed to fetch`));
+      return results;
+    }
+    
+    // Analyze batch with Copilot
+    if (options.verbose) {
+      console.log(`${prefix} Analyzing ${successfulArticles.length} articles...`);
+    }
+    const batchAnalysis = await analyzeBatchArticles(worker.copilotSession, successfulArticles, options.verbose);
+    
+    // Process results for each article
+    for (let i = 0; i < articleNames.length; i++) {
+      const articleName = articleNames[i];
+      const article = articleMap.get(articleName);
+      const result = results[i];
+      const analysis = batchAnalysis.results[articleName] || { errors: [], summary: "" };
+      
+      result.errorsFound = analysis.errors.length;
+      console.log(`${prefix} ${articleName}: ${analysis.errors.length} error(s) found`);
+      
+      // Skip if article fetch failed
+      if (!article || article.error) {
+        continue;
+      }
+      
+      // Process errors for this article
+      for (const error of analysis.errors) {
+        console.log(chalk.yellow(`${prefix} Error: "${error.text_to_select.substring(0, 50)}..."`));
+        console.log(chalk.white(`${prefix}   Problem: ${error.error_description}`));
+        console.log(chalk.white(`${prefix}   Fix: "${(error.corrected_text || "").substring(0, 50)}..."`));
+
+        if (!error.corrected_text || error.corrected_text === error.text_to_select) {
+          console.log(chalk.yellow(`${prefix}   Skipping: corrected text same as original or missing`));
+          continue;
+        }
+
+        if (options.dryRun) {
+          console.log(chalk.blue(`${prefix}   [DRY RUN] Would submit correction`));
+        } else {
+          const request: EditRequest = {
+            articleName: article.article,
+            textToSelect: error.text_to_select,
+            summary: `${error.error_description}\n\nCorrect information: ${error.correct_information}`,
+            correction: error.corrected_text,
+            sources: error.sources,
+          };
+
+          const submitResult = await submitEdit(worker.session, request, !options.headless);
+
+          if (submitResult.success) {
+            console.log(chalk.green(`${prefix}   Correction submitted`));
+            result.correctionsSubmitted++;
+          } else {
+            console.log(chalk.red(`${prefix}   Failed: ${submitResult.message}`));
+          }
+        }
+      }
+      
+      // Update running totals
+      progress.totalErrors += result.errorsFound;
+      progress.totalCorrections += result.correctionsSubmitted;
+    }
+    
+  } catch (error) {
+    console.log(chalk.red(`${prefix} Error processing batch: ${error}`));
+  }
+
+  progress.inProgress.delete(worker.id);
+  progress.completed += articleNames.length;
+  worker.articlesProcessed += articleNames.length;
+
+  return results;
+}
+
+/**
  * Create worker pool with playwright-cli sessions and Copilot sessions
  */
 async function createWorkerPool(
@@ -540,6 +919,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   console.log(chalk.bold.blue("\n=== Grokipedia Parallel Article Reviewer (playwright-cli) ===\n"));
   console.log(chalk.gray(`Iterations: ${options.iterations}`));
   console.log(chalk.gray(`Parallel workers: ${options.parallel}`));
+  console.log(chalk.gray(`Batch size: ${options.batchSize}`));
   console.log(chalk.gray(`Mode: ${options.article ? "Specific article" : options.themes?.length ? "Theme-based" : "Random"}`));
   console.log(chalk.gray(`Browser: ${options.browser}`));
   console.log(chalk.gray(`Headless: ${options.headless}`));
@@ -695,6 +1075,21 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     return null;
   };
 
+  // Get next batch of articles (up to batchSize)
+  const getNextBatch = async (workerId: number, batchSize: number): Promise<string[]> => {
+    const batch: string[] = [];
+    const remaining = options.iterations - progress.completed - (progress.inProgress.size * options.batchSize);
+    const targetSize = Math.min(batchSize, Math.max(0, remaining));
+    
+    for (let i = 0; i < targetSize; i++) {
+      const article = await getNextArticle(workerId);
+      if (!article) break;
+      batch.push(article);
+    }
+    
+    return batch;
+  };
+
   // Process articles with worker pool
   const runningTasks: Promise<void>[] = [];
 
@@ -726,53 +1121,103 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
         }
       }
       
-      const articleName = await getNextArticle(worker.id);
-      if (!articleName) {
-        await new Promise(r => setTimeout(r, 1000));
-        if (progress.completed >= options.iterations) break;
-        continue;
-      }
-
-      worker.busy = true;
-      try {
-        const result = await processArticle(worker, articleName, options, progress);
-        
-        // Memory management: only store recent results for large runs
-        if (options.iterations <= MAX_STORED_RESULTS) {
-          results.push(result);
-        } else {
-          // For large runs, keep a sliding window of recent results
-          results.push(result);
-          if (results.length > MAX_STORED_RESULTS) {
-            results.shift(); // Remove oldest
-          }
+      // Use batch processing if batchSize > 1
+      if (options.batchSize > 1) {
+        const batch = await getNextBatch(worker.id, options.batchSize);
+        if (batch.length === 0) {
+          await new Promise(r => setTimeout(r, 1000));
+          if (progress.completed >= options.iterations) break;
+          continue;
         }
-      } catch (error) {
-        const errorMsg = `[W${worker.id}] Fatal error: ${error}`;
-        console.log(chalk.red(errorMsg));
-        appendFileSync("/tmp/grokipedia-errors.log", `[${new Date().toISOString()}] ${errorMsg}\n`);
-        progress.completed++;
-        // Try to recover by getting a new session
+
+        worker.busy = true;
         try {
-          await worker.session.stop().catch(() => {});
-          worker.session = await browserManager!.createSession();
-          await refreshWorkerSession(worker, client);
-          console.log(chalk.green(`[W${worker.id}] Recovered successfully`));
-        } catch (e) {
-          console.log(chalk.yellow(`[W${worker.id}] Recovery failed, retrying in 5s...`));
-          await new Promise(r => setTimeout(r, 5000));
-          // One more attempt
+          const batchResults = await processBatch(worker, batch, options, progress);
+          
+          // Memory management: only store recent results for large runs
+          for (const result of batchResults) {
+            if (options.iterations <= MAX_STORED_RESULTS) {
+              results.push(result);
+            } else {
+              results.push(result);
+              if (results.length > MAX_STORED_RESULTS) {
+                results.shift();
+              }
+            }
+          }
+        } catch (error) {
+          const errorMsg = `[W${worker.id}] Fatal error in batch: ${error}`;
+          console.log(chalk.red(errorMsg));
+          appendFileSync("/tmp/grokipedia-errors.log", `[${new Date().toISOString()}] ${errorMsg}\n`);
+          progress.completed += batch.length;
+          // Try to recover
           try {
+            await worker.session.stop().catch(() => {});
             worker.session = await browserManager!.createSession();
             await refreshWorkerSession(worker, client);
-            console.log(chalk.green(`[W${worker.id}] Recovered on retry`));
-          } catch (e2) {
-            console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
-            break;
+            console.log(chalk.green(`[W${worker.id}] Recovered successfully`));
+          } catch (e) {
+            console.log(chalk.yellow(`[W${worker.id}] Recovery failed, retrying in 5s...`));
+            await new Promise(r => setTimeout(r, 5000));
+            try {
+              worker.session = await browserManager!.createSession();
+              await refreshWorkerSession(worker, client);
+              console.log(chalk.green(`[W${worker.id}] Recovered on retry`));
+            } catch (e2) {
+              console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
+              break;
+            }
           }
         }
+        worker.busy = false;
+      } else {
+        // Original single-article processing for batchSize=1
+        const articleName = await getNextArticle(worker.id);
+        if (!articleName) {
+          await new Promise(r => setTimeout(r, 1000));
+          if (progress.completed >= options.iterations) break;
+          continue;
+        }
+
+        worker.busy = true;
+        try {
+          const result = await processArticle(worker, articleName, options, progress);
+          
+          // Memory management: only store recent results for large runs
+          if (options.iterations <= MAX_STORED_RESULTS) {
+            results.push(result);
+          } else {
+            results.push(result);
+            if (results.length > MAX_STORED_RESULTS) {
+              results.shift();
+            }
+          }
+        } catch (error) {
+          const errorMsg = `[W${worker.id}] Fatal error: ${error}`;
+          console.log(chalk.red(errorMsg));
+          appendFileSync("/tmp/grokipedia-errors.log", `[${new Date().toISOString()}] ${errorMsg}\n`);
+          progress.completed++;
+          // Try to recover by getting a new session
+          try {
+            await worker.session.stop().catch(() => {});
+            worker.session = await browserManager!.createSession();
+            await refreshWorkerSession(worker, client);
+            console.log(chalk.green(`[W${worker.id}] Recovered successfully`));
+          } catch (e) {
+            console.log(chalk.yellow(`[W${worker.id}] Recovery failed, retrying in 5s...`));
+            await new Promise(r => setTimeout(r, 5000));
+            try {
+              worker.session = await browserManager!.createSession();
+              await refreshWorkerSession(worker, client);
+              console.log(chalk.green(`[W${worker.id}] Recovered on retry`));
+            } catch (e2) {
+              console.log(chalk.red(`[W${worker.id}] Could not recover, stopping worker`));
+              break;
+            }
+          }
+        }
+        worker.busy = false;
       }
-      worker.busy = false;
 
       await maybeResetWorkerPage(worker);
 
@@ -1076,6 +1521,7 @@ program
 program
   .option("-n, --iterations <number>", "Number of articles to review", "1")
   .option("-p, --parallel <number>", "Number of parallel workers (default: 1, sequential)", "1")
+  .option("--batch-size <number>", "Articles per Copilot call (default: 5)", "5")
   .option("-a, --article <name>", "Specific article to review")
   .option("-t, --theme <themes...>", "Theme(s) to search for articles (e.g., -t physics history)")
   .option("-b, --browser <type>", "Browser to use: chromium, chrome, edge, comet", "chromium")
@@ -1103,6 +1549,7 @@ program
     const options: ReviewOptions = {
       iterations: parseInt(opts.iterations, 10),
       parallel: parseInt(opts.parallel, 10),
+      batchSize: parseInt(opts.batchSize, 10),
       article: opts.article,
       themes: opts.theme,
       headless: !opts.headed, // Default: headless (background mode)
@@ -1121,14 +1568,25 @@ program
       process.exit(1);
     }
 
+    if (isNaN(options.batchSize) || options.batchSize < 1) {
+      console.error(chalk.red("Error: batch-size must be a positive number"));
+      process.exit(1);
+    }
+
+    // Cap batch size at 10 to avoid overly long prompts
+    if (options.batchSize > 10) {
+      console.log(chalk.yellow(`Warning: Capping batch size at 10 (requested ${options.batchSize})`));
+      options.batchSize = 10;
+    }
+
     // Cap parallel workers at 30
     if (options.parallel > 30) {
       console.log(chalk.yellow(`Warning: Capping parallel workers at 30 (requested ${options.parallel})`));
       options.parallel = 30;
     }
 
-    // Use parallel loop if more than 1 worker
-    if (options.parallel > 1) {
+    // Use parallel loop if more than 1 worker OR batch size > 1
+    if (options.parallel > 1 || options.batchSize > 1) {
       await runParallelReviewLoop(options);
     } else {
       await runReviewLoop(options);
