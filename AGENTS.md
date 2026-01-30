@@ -257,3 +257,16 @@ const PAGE_REFRESH_INTERVAL = 20;     // Recreate browser tab
 - Node.js 18+
 - User logged into Grokipedia in Comet/Chrome
 - Python 3.8+ with Playwright (for legacy scripts)
+
+---
+
+## Skills (Domain-Specific Instructions)
+
+This project has specialized skills in `.github/skills/`:
+
+| Skill | Purpose | When to use |
+|-------|---------|-------------|
+| `fact-checking` | AI error patterns, verification strategies, what to check | Analyzing article content |
+| `grokipedia-workflow` | Fetch/verify/submit loop, CLI usage, session management | Running the checker tool |
+
+**Read the relevant SKILL.md before working in that domain.**
