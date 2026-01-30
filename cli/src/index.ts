@@ -441,48 +441,24 @@ async function analyzeArticle(
   const allowInteractiveOutput = canRenderInteractiveOutput();
   const contentForAnalysis = article.content.substring(0, 15000);
 
-  const prompt = `I have already fetched this Grokipedia article for you. Please analyze it for factual errors.
+  const prompt = `Fact-check this Grokipedia article. Find ONLY clear factual errors (wrong dates, numbers, names, events).
 
 ARTICLE: "${article.article}"
-URL: ${article.url}
-
----
-ARTICLE CONTENT:
+CONTENT:
 ${contentForAnalysis}
----
 
-IMPORTANT: The article content is provided above. Do NOT try to fetch it again.
+SPEED RULES:
+- Trust your knowledge first. Only use web_search if genuinely uncertain.
+- Skip style/grammar issues. Only report FACTUAL errors.
+- Max 2 web searches. If unsure after that, skip the claim.
+- Return JSON immediately when done.
 
-Your task:
-1. Read through the article content above
-2. Identify claims that might be factually incorrect (dates, numbers, names, historical facts)
-3. Use web_fetch to verify suspicious claims against PRIMARY sources (official sites, academic journals, university pages, museum archives, published biographies). Do NOT use Wikipedia - find primary sources instead.
-4. Report only verified errors
-
-Return your findings as JSON:
+JSON format:
 \`\`\`json
-{
-  "errors": [
-    {
-      "text_to_select": "exact text from article containing the error (copy verbatim)",
-      "error_description": "what is wrong with this text",
-      "correct_information": "the verified correct fact",
-      "corrected_text": "the replacement text that should replace text_to_select (MUST be different from text_to_select)",
-      "sources": ["url used to verify"]
-    }
-  ],
-  "summary": "brief analysis summary"
-}
+{"errors":[{"text_to_select":"exact wrong text","error_description":"why wrong","corrected_text":"fixed text","sources":["url if searched"]}],"summary":"1 sentence"}
 \`\`\`
 
-CRITICAL: 
-- "text_to_select" must be the EXACT text from the article that contains the error
-- "corrected_text" must be the REPLACEMENT text with the error fixed - it MUST be different from text_to_select
-- Example: if article says "died in 1861" but correct year is 1860, then:
-  - text_to_select: "died in 1861"
-  - corrected_text: "died in 1860"
-
-If no factual errors are found, return empty errors array. Focus on factual accuracy, not style.`;
+If no errors: {"errors":[],"summary":"No factual errors found"}`;
 
   let fullResponse = "";
   let dotCount = 0;
@@ -829,7 +805,7 @@ async function createWorkerPool(
     }
     
     const copilotSession = await client.createSession({
-      model: "claude-sonnet-4.5",
+      model: "gpt-5.2-mini",
       streaming: true,
       systemMessage: { content: systemMessage },
     });
@@ -864,7 +840,7 @@ async function refreshWorkerSession(
 
   // Create fresh session
   worker.copilotSession = await client.createSession({
-    model: "claude-sonnet-4.5",
+    model: "gpt-5.2-mini",
     streaming: true,
     systemMessage: { content: systemMessage },
   });
@@ -1324,7 +1300,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
   let session;
   try {
     session = await client.createSession({
-      model: "claude-sonnet-4.5",
+      model: "gpt-5.2-mini",
       streaming: true,
       systemMessage: {
         content: buildCopilotSystemMessage(),
