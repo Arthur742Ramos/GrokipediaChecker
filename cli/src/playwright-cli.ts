@@ -1226,10 +1226,20 @@ export class PlaywrightCLISession {
         await this.syncCookiesFromBrowser();
       } else {
         // Use Playwright's bundled Chromium with persistent context
-        // On Linux, use the VNC-authenticated profile if available
-        const linuxPersistentProfile = path.join(os.homedir(), ".config/chromium-persistent/chromium-vnc");
-        const usePersistentProfile = process.platform === "linux" && fs.existsSync(linuxPersistentProfile);
-        
+        // On Linux, ALWAYS use the VNC profile (we sync cookies to it via cron)
+        // This avoids profile lock conflicts with running snap Chromium
+        // Cookie sync: cron job copies from snap profile to vnc profile every 20 min
+        const vncChromiumProfile = path.join(os.homedir(), ".config/chromium-persistent/chromium-vnc");
+        let linuxPersistentProfile = "";
+        let usePersistentProfile = false;
+        if (process.platform === "linux") {
+          // Always use vnc profile - snap profile gets locked by running Chromium
+          if (fs.existsSync(vncChromiumProfile)) {
+            linuxPersistentProfile = vncChromiumProfile;
+            usePersistentProfile = true;
+            console.log("Using VNC Chromium profile (cookies synced from snap)");
+          }
+        }
         if (usePersistentProfile) {
           console.log(`Using persistent Chromium profile at ${linuxPersistentProfile}`);
           // Use launchPersistentContext to share cookies with the VNC session
