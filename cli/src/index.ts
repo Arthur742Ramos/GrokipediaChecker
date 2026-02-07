@@ -498,15 +498,19 @@ CRITICAL:
 setupBackgroundSafeIO();
 
 function buildCopilotSystemMessage(): string {
-  return `You are an expert fact-checker. Your job is to analyze encyclopedia articles and identify factual errors.
+  return `You are a skeptical fact-checker analyzing AI-GENERATED encyclopedia articles that frequently contain hallucinated "facts".
 
-When analyzing an article:
-1. Look for claims about dates, numbers, names, events, or scientific facts
-2. Use web search to verify suspicious claims against authoritative PRIMARY sources (official government sites, academic journals, university websites, museum archives, official biographies, published books). Do NOT use Wikipedia as a source - it is not authoritative.
-3. Only report errors you have verified against primary sources - do not guess or speculate
-4. Return your findings as structured JSON
+CRITICAL: These articles are written by AI and OFTEN contain plausible-sounding but COMPLETELY FABRICATED information. Do NOT trust the content at face value.
 
-Be thorough but precise. Quality over quantity. Primary sources only.`;
+Your approach:
+1. ASSUME the article may contain fabrications until you verify claims
+2. ALWAYS use web_search to verify specific claims (dates, names, numbers, events)
+3. If you cannot find corroborating evidence for a claim, it may be fabricated - flag it
+4. Look for red flags: overly specific details, obscure "historical" events, suspiciously detailed narratives
+5. Use authoritative sources: academic sites, official records, established encyclopedias, news archives
+6. Wikipedia IS acceptable as a starting point for verification (it's more reliable than AI hallucinations)
+
+Be skeptical. Verify aggressively. These are AI-generated articles prone to hallucination.`;
 }
 
 async function analyzeArticle(
@@ -517,24 +521,31 @@ async function analyzeArticle(
   const allowInteractiveOutput = canRenderInteractiveOutput();
   const contentForAnalysis = article.content.substring(0, 15000);
 
-  const prompt = `Fact-check this Grokipedia article. Find ONLY clear factual errors (wrong dates, numbers, names, events).
+  const prompt = `Fact-check this Grokipedia article. This is AI-GENERATED content that may contain HALLUCINATED facts.
 
 ARTICLE: "${article.article}"
 CONTENT:
 ${contentForAnalysis}
 
-SPEED RULES:
-- Trust your knowledge first. Only use web_search if genuinely uncertain.
-- Skip style/grammar issues. Only report FACTUAL errors.
-- Max 2 web searches. If unsure after that, skip the claim.
-- Return JSON immediately when done.
+VERIFICATION RULES:
+- DO NOT trust your training data. This article may contain fabricated information that sounds plausible.
+- MUST use web_search to verify at least 3-5 specific claims (dates, names, numbers, events).
+- If a claim cannot be verified via web search, it may be a hallucination - report it as "unverifiable/potentially fabricated".
+- Look for red flags: obscure historical events with suspiciously specific details, people/places that don't appear in searches.
+- Wikipedia and other encyclopedias ARE valid sources for verification.
+
+WHAT TO CHECK:
+- Dates (births, deaths, events) - search for "[person name] born" or "[event] date"
+- Numbers (scores, statistics, counts) - search for official records
+- Names (people, places) - verify they exist and did what the article claims
+- Events - verify they actually happened
 
 JSON format:
 \`\`\`json
-{"errors":[{"text_to_select":"exact wrong text","error_description":"why wrong","corrected_text":"fixed text","sources":["url if searched"]}],"summary":"1 sentence"}
+{"errors":[{"text_to_select":"exact wrong text","error_description":"why wrong (include your source)","corrected_text":"fixed text OR 'UNVERIFIABLE - no evidence found'","sources":["urls you searched"]}],"summary":"1 sentence including how many claims verified"}
 \`\`\`
 
-If no errors: {"errors":[],"summary":"No factual errors found"}`;
+If all checked claims verify: {"errors":[],"summary":"Verified X claims, all accurate"}`;
 
   let fullResponse = "";
   let dotCount = 0;
