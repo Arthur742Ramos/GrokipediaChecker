@@ -2,7 +2,7 @@
 
 > **🎯 CORE MISSION**: Use `web_search` and Wikipedia to fact-check Grok-generated articles. Grok hallucinates dates, scores, and attribution—verify EVERYTHING with external sources before trusting any claim.
 
-> **Tech Stack**: TypeScript CLI with GitHub Copilot SDK (Claude Opus 4.5), Playwright browser automation, CDP for session persistence.
+> **Tech Stack**: TypeScript CLI with GitHub Copilot SDK (GPT-5.1-Codex-Mini), Playwright browser automation, CDP for session persistence.
 
 ---
 
@@ -18,7 +18,7 @@ Within weeks, users discovered Grok's articles were **confidently wrong**. Not o
 - **Superlative inflation**: Claims something is "first," "only," or "largest" without verification
 - **Sports stat fabrication**: Specific game statistics (RBIs, pitching records) are frequently invented
 
-**Our Solution**: Use AI to check AI. Claude Opus 4.5 + web_search + Wikipedia cross-referencing. The irony isn't lost on us—but Claude's access to real-time search makes it an effective fact-checker for Grok's static hallucinations.
+**Our Solution**: Use AI to check AI. GPT-5.1-Codex-Mini + web_search + Wikipedia cross-referencing. The irony isn't lost on us—but the model's access to real-time search makes it an effective fact-checker for Grok's static hallucinations.
 
 ---
 

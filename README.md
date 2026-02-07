@@ -1,6 +1,6 @@
 # Grokipedia Fact-Checker & Content Improver
 
-An AI-powered tool for automated fact-checking, content improvement, and editing of [Grokipedia](https://grokipedia.com) articles using GitHub Copilot SDK with Claude Opus 4.5 and browser automation.
+An AI-powered tool for automated fact-checking, content improvement, and editing of [Grokipedia](https://grokipedia.com) articles using GitHub Copilot SDK and browser automation.
 
 ## What It Does
 
@@ -38,9 +38,9 @@ This project systematically analyzes Grokipedia articles to:
 ```
 ┌─────────────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │  TypeScript CLI     │────▶│  Browser Manager │────▶│   Grokipedia    │
-│  (Copilot SDK +     │     │  (Playwright/CDP)│     │   (Target Site) │
-│   Claude Opus 4.5)  │     └──────────────────┘     └─────────────────┘
-└─────────────────────┘              │
+│  (Copilot SDK)      │     │  (Playwright/CDP)│     │   (Target Site) │
+└─────────────────────┘     └──────────────────┘     └─────────────────┘
+                                      │
          │                           ▼
          ▼                  ┌──────────────────┐
 ┌─────────────────────┐     │  Parallel Workers│
@@ -52,7 +52,7 @@ This project systematically analyzes Grokipedia articles to:
 ### Workflow
 
 1. **Fetch Article** → Browser automation retrieves article text
-2. **AI Analysis** → Claude Opus 4.5 identifies verifiable claims
+2. **AI Analysis** → Copilot identifies verifiable claims
 3. **Fact Verification** → Web search confirms or refutes claims
 4. **Submit Corrections** → Browser automation submits verified corrections
 
@@ -240,7 +240,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- Built with [GitHub Copilot SDK](https://github.com/github/copilot-sdk) and Claude Opus 4.5
+- Built with [GitHub Copilot SDK](https://github.com/github/copilot-sdk)
 - Browser automation via [Playwright](https://playwright.dev)
 - Fact verification via web search
 

@@ -1,6 +1,6 @@
 # Grokipedia Article Reviewer CLI
 
-Automated fact-checking tool for Grokipedia articles using the GitHub Copilot SDK with Claude Opus 4.5.
+Automated fact-checking tool for Grokipedia articles using the GitHub Copilot SDK.
 
 ## Features
 
@@ -63,7 +63,7 @@ npm start -- --list-browsers
 ## How It Works
 
 1. **Fetch**: The CLI uses Playwright to navigate to Grokipedia and extract article content
-2. **Analyze**: Content is sent to Copilot with Claude Opus 4.5 for analysis
+2. **Analyze**: Content is sent to Copilot for analysis
 3. **Verify**: Copilot uses web search to verify suspicious claims against authoritative sources
 4. **Report**: Returns structured JSON with exact text selections, error descriptions, and corrections
 5. **Submit**: (Unless --dry-run) Corrections are submitted via browser automation
@@ -87,7 +87,7 @@ Iteration 1 of 1
 
 ✔ Fetched 61550 characters
 
-Analyzing article with Claude Opus 4.5...
+Analyzing article with Copilot...
 .......................
 
 Analysis complete. Found 3 potential error(s).
