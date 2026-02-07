@@ -13,7 +13,7 @@
  * Flow:
  * 1. We fetch article content using playwright-cli
  * 2. We pass the content to Copilot for analysis
- * 3. Copilot uses web_search to verify facts and returns JSON with errors
+ * 3. Copilot uses web_fetch to verify facts and returns JSON with errors
  * 4. We parse the response and submit corrections via playwright-cli
  */
 
@@ -504,7 +504,7 @@ CRITICAL: These articles are written by AI and OFTEN contain plausible-sounding 
 
 Your approach:
 1. ASSUME the article may contain fabrications until you verify claims
-2. ALWAYS use web_search to verify specific claims (dates, names, numbers, events)
+2. ALWAYS use web_fetch to verify specific claims (dates, names, numbers, events)
 3. If you cannot find corroborating evidence for a claim, it may be fabricated - flag it
 4. Look for red flags: overly specific details, obscure "historical" events, suspiciously detailed narratives
 5. Use authoritative sources: academic sites, official records, established encyclopedias, news archives
@@ -529,7 +529,7 @@ ${contentForAnalysis}
 
 VERIFICATION RULES:
 - DO NOT trust your training data. This article may contain fabricated information that sounds plausible.
-- MUST use web_search to verify at least 3-5 specific claims (dates, names, numbers, events).
+- MUST use web_fetch to verify at least 3-5 specific claims (dates, names, numbers, events).
 - If a claim cannot be verified via web search, it may be a hallucination - report it as "unverifiable/potentially fabricated".
 - Look for red flags: obscure historical events with suspiciously specific details, people/places that don't appear in searches.
 - Wikipedia and other encyclopedias ARE valid sources for verification.
