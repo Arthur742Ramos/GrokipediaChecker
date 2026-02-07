@@ -2,7 +2,7 @@
 /**
  * Grokipedia Article Reviewer CLI
  *
- * Uses GitHub Copilot SDK with Claude Opus 4.5 to analyze articles
+ * Uses GitHub Copilot SDK with GPT-5.1-Codex-Mini to analyze articles
  * for factual errors and submit corrections.
  * 
  * Now using playwright-cli for browser automation:
@@ -75,6 +75,8 @@ interface ReviewOptions {
   headless: boolean;
   dryRun: boolean;
   verbose: boolean;
+  memoryTelemetry: boolean;
+  memoryInterval: number;
   browser: BrowserType;
 }
 
@@ -148,6 +150,67 @@ function setupBackgroundSafeIO(): void {
 
 function canRenderInteractiveOutput(): boolean {
   return Boolean(process.stdout.isTTY && process.stderr.isTTY);
+}
+
+function formatMemory(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function formatMemoryDelta(current: number, baseline: number): string {
+  const delta = current - baseline;
+  const sign = delta >= 0 ? "+" : "";
+  return `${sign}${(delta / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+interface MemoryTelemetryTracker {
+  enabled: boolean;
+  interval: number;
+  baselineRss: number;
+  baselineHeapUsed: number;
+  lastLoggedCompleted: number;
+}
+
+function createMemoryTelemetryTracker(options: ReviewOptions): MemoryTelemetryTracker {
+  const initial = process.memoryUsage();
+  return {
+    enabled: options.memoryTelemetry,
+    interval: Math.max(1, options.memoryInterval),
+    baselineRss: initial.rss,
+    baselineHeapUsed: initial.heapUsed,
+    lastLoggedCompleted: 0,
+  };
+}
+
+function maybeLogMemoryTelemetry(
+  tracker: MemoryTelemetryTracker,
+  completed: number,
+  total: number,
+  inProgress: number,
+  force: boolean = false
+): void {
+  if (!tracker.enabled) {
+    return;
+  }
+  if (!force) {
+    if (completed <= tracker.lastLoggedCompleted) {
+      return;
+    }
+    if (completed === 0 || completed % tracker.interval !== 0) {
+      return;
+    }
+  }
+
+  const mem = process.memoryUsage();
+  const line = [
+    `[MEM ${completed}/${total}]`,
+    `rss=${formatMemory(mem.rss)} (${formatMemoryDelta(mem.rss, tracker.baselineRss)})`,
+    `heap=${formatMemory(mem.heapUsed)}/${formatMemory(mem.heapTotal)} (${formatMemoryDelta(mem.heapUsed, tracker.baselineHeapUsed)})`,
+    `ext=${formatMemory(mem.external)}`,
+    `arr=${formatMemory(mem.arrayBuffers)}`,
+    `in_progress=${inProgress}`,
+  ].join(" ");
+  console.log(chalk.gray(line));
+  tracker.lastLoggedCompleted = completed;
 }
 
 /**
@@ -239,6 +302,18 @@ function parseBatchAnalysisResponse(response: string, articleNames: string[]): B
   return defaultResult;
 }
 
+function releaseArticleMemory(article: ArticleContent | null | undefined): void {
+  if (!article) return;
+  article.content = "";
+  article.sections = [];
+}
+
+function releaseArticlesMemory(articles: ArticleContent[]): void {
+  for (const article of articles) {
+    releaseArticleMemory(article);
+  }
+}
+
 /**
  * Fetch multiple articles in parallel
  */
@@ -294,18 +369,19 @@ async function analyzeBatchArticles(
   const articleNames = articles.map(a => a.article);
   
   // Build the batch prompt
-  let articlesContent = "";
+  const articleBlocks: string[] = [];
   for (let i = 0; i < articles.length; i++) {
     const article = articles[i];
     const contentForAnalysis = article.content.substring(0, 8000); // Smaller per-article limit for batches
-    articlesContent += `
+    articleBlocks.push(`
 === ARTICLE ${i + 1}: "${article.article}" ===
 URL: ${article.url}
 CONTENT:
 ${contentForAnalysis}
 
-`;
+`);
   }
+  const articlesContent = articleBlocks.join("");
 
   const prompt = `I have fetched ${articles.length} Grokipedia articles for you. Please analyze ALL of them for factual errors.
 
@@ -557,13 +633,14 @@ async function processArticle(
   progress.inProgress.set(worker.id, articleName);
   
   const prefix = chalk.cyan(`[W${worker.id}]`);
+  let article: ArticleContent | null = null;
 
   try {
     // Fetch article using playwright-cli session
     if (options.verbose) {
       console.log(`${prefix} Fetching: ${articleName}`);
     }
-    const article = await fetchArticleContent(worker.session, articleName, !options.headless);
+    article = await fetchArticleContent(worker.session, articleName, !options.headless);
 
     if (article.error) {
       console.log(chalk.red(`${prefix} Failed to fetch ${articleName}: ${article.error}`));
@@ -629,6 +706,9 @@ async function processArticle(
     
   } catch (error) {
     console.log(chalk.red(`${prefix} Error processing ${articleName}: ${error}`));
+  } finally {
+    // Release large payloads as early as possible.
+    releaseArticleMemory(article);
   }
 
   progress.inProgress.delete(worker.id);
@@ -666,24 +746,24 @@ async function processBatch(
     ? `${articleNames[0]} +${articleNames.length - 1}` 
     : articleNames[0];
   progress.inProgress.set(worker.id, batchLabel);
+  let fetchedArticles: ArticleContent[] = [];
   
   try {
     // Fetch all articles in parallel
     if (options.verbose) {
       console.log(`${prefix} Fetching batch: ${articleNames.join(", ")}`);
     }
-    const articles = await batchFetchArticles(worker.session, articleNames, !options.headless, options.verbose);
+    fetchedArticles = await batchFetchArticles(worker.session, articleNames, !options.headless, options.verbose);
     
     // Filter out failed fetches but keep track for reporting
     const successfulArticles: ArticleContent[] = [];
-    const articleMap = new Map<string, ArticleContent>();
+    const failedArticles = new Set<string>();
     
-    for (let i = 0; i < articles.length; i++) {
-      const article = articles[i];
-      articleMap.set(article.article, article);
-      
+    for (let i = 0; i < fetchedArticles.length; i++) {
+      const article = fetchedArticles[i];
       if (article.error) {
         console.log(chalk.red(`${prefix} Failed to fetch ${article.article}: ${article.error}`));
+        failedArticles.add(article.article);
       } else {
         successfulArticles.push(article);
         if (options.verbose) {
@@ -709,11 +789,12 @@ async function processBatch(
       console.log(`${prefix} Analyzing ${successfulArticles.length} articles...`);
     }
     const batchAnalysis = await analyzeBatchArticles(worker.copilotSession, successfulArticles, options.verbose);
+    releaseArticlesMemory(fetchedArticles);
+    fetchedArticles = [];
     
     // Process results for each article
     for (let i = 0; i < articleNames.length; i++) {
       const articleName = articleNames[i];
-      const article = articleMap.get(articleName);
       const result = results[i];
       const analysis = batchAnalysis.results[articleName] || { errors: [], summary: "" };
       
@@ -721,7 +802,7 @@ async function processBatch(
       console.log(`${prefix} ${articleName}: ${analysis.errors.length} error(s) found`);
       
       // Skip if article fetch failed
-      if (!article || article.error) {
+      if (failedArticles.has(articleName)) {
         continue;
       }
       
@@ -740,7 +821,7 @@ async function processBatch(
           console.log(chalk.blue(`${prefix}   [DRY RUN] Would submit correction`));
         } else {
           const request: EditRequest = {
-            articleName: article.article,
+            articleName,
             textToSelect: error.text_to_select,
             summary: `${error.error_description}\n\nCorrect information: ${error.correct_information}`,
             correction: error.corrected_text,
@@ -765,6 +846,8 @@ async function processBatch(
     
   } catch (error) {
     console.log(chalk.red(`${prefix} Error processing batch: ${error}`));
+  } finally {
+    releaseArticlesMemory(fetchedArticles);
   }
 
   progress.inProgress.delete(worker.id);
@@ -805,7 +888,7 @@ async function createWorkerPool(
     }
     
     const copilotSession = await client.createSession({
-      model: "gpt-5.2-mini",
+      model: "gpt-5.1-codex-mini",
       streaming: true,
       systemMessage: { content: systemMessage },
     });
@@ -840,7 +923,7 @@ async function refreshWorkerSession(
 
   // Create fresh session
   worker.copilotSession = await client.createSession({
-    model: "gpt-5.2-mini",
+    model: "gpt-5.1-codex-mini",
     streaming: true,
     systemMessage: { content: systemMessage },
   });
@@ -901,6 +984,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   console.log(chalk.gray(`Headless: ${options.headless}`));
   console.log(chalk.gray(`Dry run: ${options.dryRun}`));
   console.log(chalk.gray(`Verbose: ${options.verbose}`));
+  console.log(chalk.gray(`Memory telemetry: ${options.memoryTelemetry ? `on (every ${options.memoryInterval})` : "off"}`));
   console.log();
 
   // Start browser manager
@@ -969,17 +1053,39 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     totalErrors: 0,
     totalCorrections: 0,
   };
+  const memoryTracker = createMemoryTelemetryTracker(options);
 
   // Don't store all results in memory for large runs - just keep recent for summary
   // For runs > 100 articles, only keep last 100 results to show
   const MAX_STORED_RESULTS = 100;
   const results: ArticleResult[] = [];
+  let resultsCursor = 0;
+  let resultsWrapped = false;
+
+  const pushResult = (result: ArticleResult): void => {
+    if (results.length < MAX_STORED_RESULTS) {
+      results.push(result);
+      return;
+    }
+    results[resultsCursor] = result;
+    resultsCursor = (resultsCursor + 1) % MAX_STORED_RESULTS;
+    resultsWrapped = true;
+  };
+
+  const getOrderedRecentResults = (): ArticleResult[] => {
+    if (!resultsWrapped) {
+      return results;
+    }
+    return [...results.slice(resultsCursor), ...results.slice(0, resultsCursor)];
+  };
 
   // Shared state for topic generation
   let topicIndex = 0;
   const topicBatchSize = 10;
   let topicCache: string[] = [];
   const usedTopics = new Set<string>();
+  const usedTopicOrder: string[] = [];
+  const USED_TOPIC_WINDOW = 1000;
   let topicGenerationPromise: Promise<void> | null = null;
   let topicGenerationErrorCount = 0;
   const MAX_TOPIC_GENERATION_ERRORS = 3;
@@ -1035,17 +1141,17 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     if (topicGenerationErrorCount >= MAX_TOPIC_GENERATION_ERRORS && topicCache.length === 0) {
       return null;
     }
-    
-    // Periodically clear old entries from usedTopics to prevent unbounded growth
-    // Keep only recent entries (roughly last 1000)
-    if (usedTopics.size > 2000) {
-      const entries = Array.from(usedTopics);
-      entries.slice(0, 1000).forEach(t => usedTopics.delete(t));
-    }
-    
+
     const topic = topicCache.shift();
     if (topic) {
       usedTopics.add(topic);
+      usedTopicOrder.push(topic);
+      if (usedTopicOrder.length > USED_TOPIC_WINDOW) {
+        const oldest = usedTopicOrder.shift();
+        if (oldest) {
+          usedTopics.delete(oldest);
+        }
+      }
       return topic;
     }
     return null;
@@ -1112,14 +1218,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
           
           // Memory management: only store recent results for large runs
           for (const result of batchResults) {
-            if (options.iterations <= MAX_STORED_RESULTS) {
-              results.push(result);
-            } else {
-              results.push(result);
-              if (results.length > MAX_STORED_RESULTS) {
-                results.shift();
-              }
-            }
+            pushResult(result);
           }
         } catch (error) {
           const errorMsg = `[W${worker.id}] Fatal error in batch: ${error}`;
@@ -1160,14 +1259,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
           const result = await processArticle(worker, articleName, options, progress);
           
           // Memory management: only store recent results for large runs
-          if (options.iterations <= MAX_STORED_RESULTS) {
-            results.push(result);
-          } else {
-            results.push(result);
-            if (results.length > MAX_STORED_RESULTS) {
-              results.shift();
-            }
-          }
+          pushResult(result);
         } catch (error) {
           const errorMsg = `[W${worker.id}] Fatal error: ${error}`;
           console.log(chalk.red(errorMsg));
@@ -1196,6 +1288,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
       }
 
       await maybeResetWorkerPage(worker);
+      maybeLogMemoryTelemetry(memoryTracker, progress.completed, progress.total, progress.inProgress.size);
 
       if (!options.verbose && allowInteractiveOutput) {
         displayProgress(progress);
@@ -1211,6 +1304,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   }
 
   await Promise.all(runningTasks);
+  maybeLogMemoryTelemetry(memoryTracker, progress.completed, progress.total, progress.inProgress.size, true);
 
   if (allowInteractiveOutput) {
     console.log("\n");
@@ -1224,7 +1318,7 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
     console.log(chalk.bold("Results by worker:"));
     
     const byWorker = new Map<number, ArticleResult[]>();
-    for (const r of results) {
+    for (const r of getOrderedRecentResults()) {
       if (!byWorker.has(r.workerId)) {
         byWorker.set(r.workerId, []);
       }
@@ -1240,7 +1334,8 @@ async function runParallelReviewLoop(options: ReviewOptions): Promise<void> {
   } else {
     // Large run: show summary only (we didn't store all results)
     console.log(chalk.gray(`(Detailed per-article breakdown omitted for large runs)`));
-    console.log(chalk.gray(`Recent articles processed: ${results.map(r => r.article).slice(-10).join(", ")}...`));
+    const recent = getOrderedRecentResults();
+    console.log(chalk.gray(`Recent articles processed: ${recent.map(r => r.article).slice(-10).join(", ")}...`));
   }
 
   // Use running totals from progress object (more memory efficient)
@@ -1268,6 +1363,7 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
   console.log(chalk.gray(`Headless: ${options.headless}`));
   console.log(chalk.gray(`Dry run: ${options.dryRun}`));
   console.log(chalk.gray(`Verbose: ${options.verbose}`));
+  console.log(chalk.gray(`Memory telemetry: ${options.memoryTelemetry ? `on (every ${options.memoryInterval})` : "off"}`));
   console.log();
 
   // Start browser
@@ -1295,12 +1391,12 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
     process.exit(1);
   }
 
-  // Create session with Claude Opus 4.5
-  spinner.start("Creating Copilot session with Claude Opus 4.5...");
+  // Create Copilot session
+  spinner.start("Creating Copilot session...");
   let session;
   try {
     session = await client.createSession({
-      model: "gpt-5.2-mini",
+      model: "gpt-5.1-codex-mini",
       streaming: true,
       systemMessage: {
         content: buildCopilotSystemMessage(),
@@ -1341,8 +1437,32 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
     }
   }
 
-  // Track results
+  // Track only recent results and running totals to keep memory bounded.
+  const MAX_STORED_RESULTS = 100;
   const results: { article: string; errorsFound: number; correctionsSubmitted: number }[] = [];
+  let resultsCursor = 0;
+  let resultsWrapped = false;
+  let totalErrors = 0;
+  let totalCorrections = 0;
+  let completedIterations = 0;
+  const memoryTracker = createMemoryTelemetryTracker(options);
+
+  const pushResult = (result: { article: string; errorsFound: number; correctionsSubmitted: number }): void => {
+    if (results.length < MAX_STORED_RESULTS) {
+      results.push(result);
+      return;
+    }
+    results[resultsCursor] = result;
+    resultsCursor = (resultsCursor + 1) % MAX_STORED_RESULTS;
+    resultsWrapped = true;
+  };
+
+  const getOrderedRecentResults = (): { article: string; errorsFound: number; correctionsSubmitted: number }[] => {
+    if (!resultsWrapped) {
+      return results;
+    }
+    return [...results.slice(resultsCursor), ...results.slice(0, resultsCursor)];
+  };
 
   // Main review loop
   for (let i = 0; i < options.iterations; i++) {
@@ -1374,8 +1494,9 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
     }
 
     // Analyze with Copilot
-    console.log(chalk.cyan("\nAnalyzing article with Claude Opus 4.5...\n"));
+    console.log(chalk.cyan("\nAnalyzing article with Copilot...\n"));
     const analysis = await analyzeArticle(session, article, options.verbose);
+    releaseArticleMemory(article);
 
     console.log(chalk.bold(`\nAnalysis complete. Found ${analysis.errors.length} potential error(s).`));
 
@@ -1426,22 +1547,32 @@ async function runReviewLoop(options: ReviewOptions): Promise<void> {
       }
     }
 
-    results.push({
+    const iterationResult = {
       article: articleName,
       errorsFound: analysis.errors.length,
       correctionsSubmitted,
-    });
+    };
+    pushResult(iterationResult);
+    totalErrors += iterationResult.errorsFound;
+    totalCorrections += iterationResult.correctionsSubmitted;
+    completedIterations++;
+    maybeLogMemoryTelemetry(memoryTracker, completedIterations, options.iterations, 0);
   }
+  maybeLogMemoryTelemetry(memoryTracker, completedIterations, options.iterations, 0, true);
 
   // Print summary
   console.log(chalk.bold.green("\n=== Review Complete ===\n"));
-  console.log(chalk.bold("Results:"));
-  for (const result of results) {
-    console.log(chalk.white(`  ${result.article}: ${result.errorsFound} errors found, ${result.correctionsSubmitted} corrections submitted`));
+  if (options.iterations <= MAX_STORED_RESULTS) {
+    console.log(chalk.bold("Results:"));
+    for (const result of getOrderedRecentResults()) {
+      console.log(chalk.white(`  ${result.article}: ${result.errorsFound} errors found, ${result.correctionsSubmitted} corrections submitted`));
+    }
+  } else {
+    const recent = getOrderedRecentResults();
+    console.log(chalk.gray(`(Detailed per-article breakdown omitted for large runs)`));
+    console.log(chalk.gray(`Recent articles processed: ${recent.map(r => r.article).slice(-10).join(", ")}...`));
   }
 
-  const totalErrors = results.reduce((sum, r) => sum + r.errorsFound, 0);
-  const totalCorrections = results.reduce((sum, r) => sum + r.correctionsSubmitted, 0);
   console.log(chalk.bold(`\nTotal: ${totalErrors} errors found, ${totalCorrections} corrections submitted`));
 
   spinner.start("Cleaning up...");
@@ -1504,6 +1635,8 @@ program
   .option("--headed", "Show browser window (default: headless/background)")
   .option("--dry-run", "Analyze without submitting corrections")
   .option("-v, --verbose", "Show Copilot's reasoning and tool calls")
+  .option("--memory-telemetry", "Print periodic process memory usage")
+  .option("--memory-interval <number>", "Memory telemetry interval in completed articles", process.env.GROKIPEDIA_MEMORY_INTERVAL || "10")
   .option("--list-browsers", "List available browsers")
   .action(async (opts) => {
     if (opts.listBrowsers) {
@@ -1522,6 +1655,7 @@ program
       process.exit(1);
     }
 
+    const memoryTelemetryFromEnv = process.env.GROKIPEDIA_MEMORY_TELEMETRY === "1";
     const options: ReviewOptions = {
       iterations: parseInt(opts.iterations, 10),
       parallel: parseInt(opts.parallel, 10),
@@ -1531,6 +1665,8 @@ program
       headless: !opts.headed, // Default: headless (background mode)
       dryRun: opts.dryRun || false,
       verbose: opts.verbose || false,
+      memoryTelemetry: Boolean(opts.memoryTelemetry || memoryTelemetryFromEnv),
+      memoryInterval: parseInt(opts.memoryInterval, 10),
       browser: opts.browser as BrowserType,
     };
 
@@ -1546,6 +1682,11 @@ program
 
     if (isNaN(options.batchSize) || options.batchSize < 1) {
       console.error(chalk.red("Error: batch-size must be a positive number"));
+      process.exit(1);
+    }
+
+    if (isNaN(options.memoryInterval) || options.memoryInterval < 1) {
+      console.error(chalk.red("Error: memory-interval must be a positive number"));
       process.exit(1);
     }
 

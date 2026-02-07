@@ -6,6 +6,15 @@
 import { PlaywrightCLISession, findRefByText } from "./playwright-cli.js";
 import { CopilotClient } from "@github/copilot-sdk";
 
+const DEFAULT_MAX_CONTENT_CHARS = 30000;
+const MAX_CONTENT_CHARS = (() => {
+  const raw = process.env.GROKIPEDIA_MAX_CONTENT_CHARS;
+  if (!raw) return DEFAULT_MAX_CONTENT_CHARS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CONTENT_CHARS;
+})();
+const EXTRACT_SECTIONS = process.env.GROKIPEDIA_EXTRACT_SECTIONS === "1";
+
 export interface ArticleSection {
   level: string;
   title: string;
@@ -124,38 +133,41 @@ export async function fetchArticleContent(
         return article ? article.innerText : document.body.innerText;
       })()
     `;
-    result.content = await session.eval(contentScript);
+    const content = await session.eval(contentScript);
+    result.content = content.slice(0, MAX_CONTENT_CHARS);
 
-    // Extract sections using eval
-    const sectionsScript = `
-      (function() {
-        var sections = [];
-        var headings = document.querySelectorAll("h1, h2, h3");
+    if (EXTRACT_SECTIONS) {
+      // Optional, because section extraction can duplicate a lot of text in memory.
+      const sectionsScript = `
+        (function() {
+          var sections = [];
+          var headings = document.querySelectorAll("h1, h2, h3");
 
-        headings.forEach(function(heading) {
-          var content = "";
-          var sibling = heading.nextElementSibling;
+          headings.forEach(function(heading) {
+            var content = "";
+            var sibling = heading.nextElementSibling;
 
-          while (sibling && ["H1", "H2", "H3"].indexOf(sibling.tagName) === -1) {
-            content += sibling.innerText + "\\n";
-            sibling = sibling.nextElementSibling;
-          }
+            while (sibling && ["H1", "H2", "H3"].indexOf(sibling.tagName) === -1) {
+              content += sibling.innerText + "\\n";
+              sibling = sibling.nextElementSibling;
+            }
 
-          sections.push({
-            level: heading.tagName,
-            title: heading.innerText,
-            content: content.trim(),
+            sections.push({
+              level: heading.tagName,
+              title: heading.innerText,
+              content: content.trim(),
+            });
           });
-        });
 
-        return JSON.stringify(sections);
-      })()
-    `;
-    const sectionsJson = await session.eval(sectionsScript);
-    try {
-      result.sections = JSON.parse(sectionsJson);
-    } catch {
-      result.sections = [];
+          return JSON.stringify(sections);
+        })()
+      `;
+      const sectionsJson = await session.eval(sectionsScript);
+      try {
+        result.sections = JSON.parse(sectionsJson);
+      } catch {
+        result.sections = [];
+      }
     }
   } catch (error) {
     result.error = String(error);
@@ -260,7 +272,7 @@ export async function generateRandomArticleTopics(
     if (batchCount <= 0) break;
 
     const session = await client.createSession({
-      model: "gpt-5.2-mini",
+      model: "gpt-5.1-codex-mini",
       streaming: true,
       systemMessage: {
         content: `You are a helpful assistant that generates random encyclopedia article topics.

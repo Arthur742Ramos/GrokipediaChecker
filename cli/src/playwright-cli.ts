@@ -1957,6 +1957,20 @@ export class PlaywrightCLIManager {
       headed: headed ?? this.headed,
       browserType: this.browserType,
     });
+
+    // Auto-prune stopped/deleted sessions so long runs do not retain dead session objects.
+    const originalStop = session.stop.bind(session);
+    session.stop = async (): Promise<void> => {
+      await originalStop();
+      this.sessions.delete(sessionName);
+    };
+
+    const originalDelete = session.delete.bind(session);
+    session.delete = async (): Promise<void> => {
+      await originalDelete();
+      this.sessions.delete(sessionName);
+    };
+
     this.sessions.set(sessionName, session);
     return session;
   }
@@ -1990,7 +2004,7 @@ export class PlaywrightCLIManager {
    * Stop all managed sessions
    */
   async stopAll(): Promise<void> {
-    for (const [name, session] of this.sessions) {
+    for (const [name, session] of Array.from(this.sessions.entries())) {
       await session.stop();
     }
     this.sessions.clear();
